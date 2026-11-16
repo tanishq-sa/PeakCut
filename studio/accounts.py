@@ -5,9 +5,11 @@ platform's own page and come back. For that, whoever runs the server registers o
 (its id and secret), in .env or in the dashboard (Settings, Connected apps, Set up). Those belong to the server,
 never to users."""
 import base64
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import threading
@@ -338,11 +340,35 @@ def _yt_token(acc) -> str:
     return acc["access_token"]
 
 
-def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str):
+def youtube_publish_time(value, lead=0) -> float:
+    """The browser sends an absolute time, so the server's own time zone never changes the choice."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("Choose a valid date and time for YouTube.")
+    try:
+        datetime.fromtimestamp(value, timezone.utc)
+    except (ValueError, OverflowError, OSError) as e:
+        raise ValueError("Choose a valid date and time for YouTube.") from e
+    if value <= time.time() + lead:
+        raise ValueError("Choose a time at least five minutes from now." if lead else
+                         "That publishing time has passed. Choose a new time.")
+    return float(value)
+
+
+class YouTubeScheduleUnconfirmed(ValueError):
+    def __init__(self, remote_id):
+        super().__init__("Uploaded, but YouTube did not confirm the publishing time. Check YouTube Studio before closing PeakCut or uploading again.")
+        self.remote_id = remote_id
+
+
+def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str, publish_at=None):
+    if publish_at is not None:
+        publish_at = youtube_publish_time(publish_at)
     token = _yt_token(acc)
     meta = {"snippet": {"title": re.sub(r"[<>]", "", title)[:100] or "Clip", "description": re.sub(r"[<>]", "", description)[:4900],
                         "tags": tags[:15], "categoryId": "20"},
             "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}}
+    if publish_at is not None:
+        meta["status"].update(privacyStatus="private", publishAt=datetime.fromtimestamp(publish_at, timezone.utc).isoformat().replace("+00:00", "Z"))
     size = path.stat().st_size
     start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
                               params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
@@ -352,6 +378,14 @@ def youtube_upload(acc, path: Path, title: str, description: str, tags: list, pr
         done = _check(httpx.put(start.headers["Location"], content=f.read(),
                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}, timeout=900),
                       "Uploading to YouTube").json()
+    if publish_at is not None:
+        try:
+            actual = datetime.fromisoformat(done.get("status", {}).get("publishAt", "").replace("Z", "+00:00"))
+            confirmed = actual.tzinfo is not None and abs(actual.timestamp() - publish_at) < 1
+        except (ValueError, TypeError):
+            confirmed = False
+        if not confirmed or done.get("status", {}).get("privacyStatus") != "private":
+            raise YouTubeScheduleUnconfirmed(done["id"])
     return done["id"], f"https://www.youtube.com/shorts/{done['id']}"
 
 

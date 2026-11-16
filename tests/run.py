@@ -51,13 +51,16 @@ def main() -> int:
                 ("deleting and bulk actions", ["tests/test_delete.py"]),
                 ("big uploads in pieces", ["tests/test_upload_parts.py", BASE]),
                 ("AI services", ["tests/test_ai.py"]),
+                ("YouTube live chat and reaction spikes", ["tests/test_youtube_chat.py"]),
                 ("no sign-in, and the AI key from the dashboard", ["tests/test_local.py"]),
                 ("Hindi and Urdu captions in Roman letters", ["tests/test_roman.py"]),
                 ("connecting YouTube, Instagram and TikTok", ["tests/test_connect.py"]),
+                ("YouTube publishes scheduled clips while PeakCut is closed", ["tests/test_youtube_schedule.py"]),
                 ("the new-version notice", ["tests/test_updates.py"]),
                 ("no limits by default", ["tests/test_limits.py"]),
                 ("captions never overlap, stuck clips, sentence endings", ["tests/test_stuck.py"]),
                 ("fresh installs: ffmpeg, the speech model, AI errors", ["tests/test_tools.py"]),
+                ("ffmpeg caption support", ["tests/test_caption_tools.py"]),
                 ("the storage folder: full drive, open, move", ["tests/test_storage.py"])]
         for name, args in runs:
             print(f"\n=== {name} ===", flush=True)

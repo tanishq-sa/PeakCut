@@ -1,5 +1,6 @@
 """Live sessions: record a stream into a rolling buffer, transcribe as it goes, let the AI pick clips."""
 import collections
+from datetime import datetime
 import json
 import re
 import socket
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import httpx
 
 from . import alerts, auth, brain, config, creators, ctx, jobs, load, media, transcribe, usage
 
@@ -66,7 +68,7 @@ def resolve(url: str) -> dict:
     title = info.get("title") or ""
     if "(live)" in title and info.get("description"):  # Twitch puts the real stream title here
         title = str(info["description"]).splitlines()[0][:120]
-    return {"urls": [f["url"] for f in fmts], "title": title,
+    return {"urls": [f["url"] for f in fmts], "title": title, "video_id": info.get("id", ""),
             "uploader": info.get("uploader") or info.get("channel") or ""}
 
 
@@ -117,6 +119,7 @@ class Session:
         self.chat = collections.Counter()   # second -> messages
         self.chat_total = 0
         self.chat_on = False
+        self.chat_status = ""
         self.last_check = 0.0
         self.words_at_check = 0
         self.checks = 0
@@ -141,9 +144,6 @@ class Session:
         SESSIONS[self.job["id"]] = self
         threading.Thread(target=ctx.bind(self._ingest), daemon=True).start()
         threading.Thread(target=ctx.bind(self._analyze), daemon=True).start()
-        m = re.match(r"^https?://(?:www\.)?twitch\.tv/([A-Za-z0-9_]+)", self.job["source"]["url"])
-        if m:
-            threading.Thread(target=ctx.bind(self._chat), args=(m.group(1).lower(),), daemon=True).start()
 
     def stop(self, note="Stopped by you"):
         """Instant for the user: the card and the creator show as stopped straight away. Clips already being made
@@ -173,6 +173,8 @@ class Session:
                 continue
             if not self.job.get("uploader"):
                 self.job.update(title=info["title"], uploader=info["uploader"])
+            if self.part == 0:
+                self._start_chat(info)
             self.part += 1
             with self.lock:
                 self.seg_clock = max(self.seg_clock, self.samples / SR)
@@ -229,7 +231,102 @@ class Session:
             while self.segments and self.segments[0][2] < keep_from:
                 self.segments.pop(0)[0].unlink(missing_ok=True)
 
-    # ---------------------------------------------------------------- chat (Twitch only)
+    # ---------------------------------------------------------------- chat
+    def _start_chat(self, info):
+        url = self.job["source"]["url"]
+        m = re.match(r"^https?://(?:www\.)?twitch\.tv/([A-Za-z0-9_]+)", url)
+        if m:
+            threading.Thread(target=ctx.bind(self._chat), args=(m.group(1).lower(),), daemon=True).start()
+        elif media.is_youtube(url) and info.get("video_id"):
+            threading.Thread(target=ctx.bind(self._youtube_chat), args=(info["video_id"],), daemon=True).start()
+
+    def _youtube_chat(self, video_id):
+        """Count new messages on the recording clock. Chat problems never stop the recording."""
+        key = config.youtube_chat_key()
+        if not key:
+            self.chat_status = "YouTube chat needs PEAKCUT_YOUTUBE_CHAT_KEY in .env. Recording continues."
+            return
+        self.chat_status = "Connecting to YouTube chat…"
+        chat_id, token = None, None
+        seen = collections.OrderedDict()
+        delay = 5
+        try:
+            with httpx.Client(timeout=20, headers={"x-goog-api-key": key}) as client:
+                while not self.stop_flag.is_set() and not self.ended:
+                    try:
+                        params = {"part": "liveStreamingDetails", "id": video_id} if not chat_id else {
+                            "part": "id,snippet", "liveChatId": chat_id, "maxResults": 2000}
+                        if chat_id and token:
+                            params["pageToken"] = token
+                        endpoint = "liveChat/messages" if chat_id else "videos"
+                        response = client.get("https://www.googleapis.com/youtube/v3/" + endpoint, params=params)
+                        if response.status_code == 429:
+                            delay = max(delay, float(response.headers.get("Retry-After", delay)))
+                        body = response.json()
+                        if not isinstance(body, dict):
+                            raise ValueError("Unreadable chat response")
+                        if response.status_code in (400, 401, 403, 404):
+                            reasons = {e.get("reason") for e in body.get("error", {}).get("errors", [])}
+                            if "invalidPageToken" in reasons and token:
+                                token = None  # next page is history again; never count it as a new burst
+                                self.chat_on = False
+                                self.stop_flag.wait(5)
+                                continue
+                            if reasons & {"quotaExceeded", "dailyLimitExceeded"}:
+                                self.chat_status = "YouTube chat quota reached. Recording continues without chat."
+                            else:
+                                self.chat_status = "YouTube chat unavailable. Check the API key and whether chat is enabled."
+                            return
+                        response.raise_for_status()
+                        if not chat_id:
+                            items = body.get("items", [])
+                            chat_id = items[0].get("liveStreamingDetails", {}).get("activeLiveChatId") if items else None
+                            if not chat_id:
+                                self.chat_status = "YouTube chat unavailable for this stream. Recording continues."
+                                return
+                            continue
+                        if body.get("offlineAt"):
+                            self.chat_status = "YouTube chat ended."
+                            return
+                        received = time.time()
+                        with self.lock:
+                            recorded = self.samples / SR
+                            for item in body.get("items", []):
+                                mid = item.get("id")
+                                if not mid or mid in seen:
+                                    continue
+                                seen[mid] = None
+                                if len(seen) > 10000:
+                                    seen.popitem(last=False)
+                                snippet = item.get("snippet", {})
+                                if not token or snippet.get("type") not in (
+                                        "textMessageEvent", "superChatEvent", "superStickerEvent",
+                                        "newSponsorEvent", "memberMilestoneChatEvent", "membershipGiftingEvent"):
+                                    continue
+                                try:
+                                    published = datetime.fromisoformat(snippet["publishedAt"].replace("Z", "+00:00"))
+                                    if published.tzinfo is None:
+                                        continue
+                                    second = recorded - (received - published.timestamp())
+                                except (KeyError, ValueError, TypeError):
+                                    continue
+                                if 0 <= second <= recorded:
+                                    self.chat[int(second)] += 1
+                                    self.chat_total += 1
+                        token = body.get("nextPageToken")
+                        self.chat_on = True
+                        self.chat_status = "Watching YouTube chat"
+                        delay = 5
+                        # Spread messages by their published times rather than making each page look like a burst.
+                        self.stop_flag.wait(max(1, float(body.get("pollingIntervalMillis", 5000)) / 1000))
+                    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                        self.chat_on = False
+                        self.chat_status = "YouTube chat disconnected; trying again. Recording continues."
+                        self.stop_flag.wait(delay)
+                        delay = min(60, delay * 2)
+        finally:
+            self.chat_on = False
+
     def _chat(self, channel):
         while not self.stop_flag.is_set() and not self.ended:
             try:
@@ -530,6 +627,7 @@ class Session:
                 live={"elapsed": round(elapsed), "buffer_sec": round(self.segments[-1][2] - self.segments[0][1]) if self.segments else 0,
                       "lines": [l["text"] for l in lines], "level": [round(x) for x in self.db[-60:]],
                       "chat": [self.chat.get(t, 0) for t in range(max(0, sec - 60), sec)] if self.chat_on or self.chat_total else None,
+                      "chat_status": self.chat_status,
                       "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
                       "rejected": self.rejected, "verdicts": list(reversed(self.verdicts)),
                       "every_min": int(self.settings.get("ai_every_min", 3)) or 3,

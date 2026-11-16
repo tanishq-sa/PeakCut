@@ -23,7 +23,8 @@ creator's live stream and clip the highlights while the stream is still running.
 
 ## Quick start
 
-You need Python 3.10 or newer and `ffmpeg`. On Windows: `winget install Gyan.FFmpeg`. On a Mac: `brew install ffmpeg`.
+You need Python 3.10 or newer and `ffmpeg` with caption support (libass). On Windows: `winget install Gyan.FFmpeg`.
+On a Mac: `brew install ffmpeg-full` (PeakCut finds this build automatically).
 On Linux: `sudo apt install ffmpeg`. PeakCut finds it by itself and tells you in the dashboard if it is missing.
 
 ```bash
@@ -95,6 +96,39 @@ Everything is set through environment variables, normally in a `.env` file next 
 | `PEAKCUT_DATA` | Where videos, clips and the database are kept (default `./data`) |
 
 `.env`, the `secrets/` folder and all user data are ignored by git. Keep keys there, never in the code.
+
+## Schedule a clip on YouTube
+
+Open a finished clip and tick the YouTube account you want to use. Under **Schedule on YouTube**, choose a date
+and time in the time zone shown, then press **Upload and schedule on YouTube**. Choose at least five minutes
+ahead, and allow enough time for your connection to upload the video.
+
+PeakCut uploads the clip privately now and asks YouTube to make it public at the chosen time. **Keep PeakCut
+open until the clip says “Scheduled on YouTube”.** Once that appears, you can close PeakCut or turn off your
+computer: YouTube holds the publishing time. If uploads are paused, resume them first. This option works only
+with YouTube accounts; the normal **Add to queue** option still needs PeakCut running.
+
+After YouTube confirms a schedule, change or cancel it in **YouTube Studio**, using the link in the post queue.
+Pausing posting or deleting a clip inside PeakCut does not cancel a schedule already held by YouTube. If an upload
+is interrupted or YouTube does not confirm the time, check YouTube Studio before retrying to avoid a duplicate.
+
+## Live chat reactions
+
+Twitch chat is watched automatically. To watch YouTube live chat too, enable **YouTube Data API v3** in your
+Google Cloud project, create an API key restricted to that API, and set `PEAKCUT_YOUTUBE_CHAT_KEY` in `.env`.
+You can instead set `PEAKCUT_YOUTUBE_CHAT_KEY_FILE` to a file holding the key. Restart PeakCut and start a new
+YouTube recording. Channel links and direct live-video links both work; no posting account needs to be connected.
+
+The live card shows whether chat is connected. A sudden rise in chat activity sends the AI the **30 seconds
+before and 20 seconds after** the reaction, so it can find the setup and payoff. The AI still decides whether
+the moment is worth clipping; a chat spike does not guarantee a clip, and a moment with little speech may be skipped.
+
+Only new messages are counted. Their published times are lined up with the recording clock so a batch of messages
+does not look like an instant burst. This is approximate: stream playback delay and a viewer's reaction time can
+shift the match. YouTube chat uses the project's API quota and follows YouTube's polling interval. If the key is
+missing, chat is disabled, or quota runs out, recording and loudness/transcript checks continue without chat.
+See [YouTube's chat API documentation](https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatMessages/list)
+for polling and quota details. Long recordings may need additional quota.
 
 ## Admins
 

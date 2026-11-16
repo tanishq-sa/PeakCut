@@ -20,6 +20,7 @@ def _mine() -> list:
     u = ctx.uid()
     return [p for p in _posts if p.get("user") == u]
 OPEN = ("scheduled", "posting")
+ON_YOUTUBE = ("youtube_scheduled", "needs_review")
 
 
 def _save():
@@ -38,23 +39,30 @@ def _mirror(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
-        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "error")}
+        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "publish_at", "error")}
         jobs.save(job)
 
 
 def _next_slot(account_id, gap_min, cap):
     """Earliest time that respects the gap between posts and the daily cap for this account."""
-    mine = [p for p in _mine() if p["account"] == account_id and p["status"] in OPEN + ("posted",)]
-    t = max(time.time(), max((p.get("posted_at") or p["due_at"] for p in mine), default=0) + gap_min * 60)
+    mine = [p for p in _mine() if p["account"] == account_id and p["status"] in OPEN + ON_YOUTUBE + ("posted",)]
+    t = max(time.time(), max((p.get("publish_at") or p.get("posted_at") or p["due_at"] for p in mine), default=0) + gap_min * 60)
     for _ in range(30):
-        if sum(1 for p in mine if _day(p.get("posted_at") or p["due_at"]) == _day(t)) < cap:
+        if sum(1 for p in mine if _day(p.get("publish_at") or p.get("posted_at") or p["due_at"]) == _day(t)) < cap:
             break
         lt = time.localtime(t + 86400)
         t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 9, 0, 0, 0, 0, -1))  # 9:00 next day
     return t
 
 
-def enqueue(job, clip, account_ids, now=False) -> list:
+def enqueue(job, clip, account_ids, now=False, publish_at=None) -> list:
+    if publish_at is not None:
+        publish_at = accounts.youtube_publish_time(publish_at, lead=300)
+        if now:
+            raise ValueError("Choose either Post now or a YouTube publishing time.")
+        selected = [accounts.get(aid) for aid in account_ids]
+        if not selected or any(not acc or acc["platform"] != "youtube" for acc in selected):
+            raise ValueError("Choose connected YouTube accounts only when setting a publishing time.")
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -63,13 +71,15 @@ def enqueue(job, clip, account_ids, now=False) -> list:
             if not acc:
                 continue
             if any(p["job"] == job["id"] and p["clip"] == clip["id"] and p["account"] == aid
-                   and p["status"] in OPEN + ("posted",) for p in _mine()):
+                   and p["status"] in OPEN + ON_YOUTUBE + ("posted",) for p in _mine()):
                 continue  # never post the same clip to the same account twice
-            due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
+            due = time.time() if now or publish_at is not None else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
             p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
                  "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
                  "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None}
+            if publish_at is not None:
+                p["publish_at"] = publish_at
             _posts.append(p)
             made.append(p)
         _save()
@@ -108,19 +118,30 @@ def _post(p):
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
         title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
         if acc["platform"] == "youtube":
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"])
+            schedule = {}
+            if p.get("publish_at") is not None:
+                schedule["publish_at"] = accounts.youtube_publish_time(p["publish_at"])
+            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"], **schedule)
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
         elif acc["platform"] == "tiktok":
             rid, url = accounts.tiktok_upload(acc, path, f"{title}\n\n{cap}", creator["privacy"])
         else:
             raise RuntimeError("That kind of account is no longer supported.")
-        p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
-        creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
+        if p.get("publish_at") is not None:
+            p.update(status="youtube_scheduled", uploaded_at=time.time(), remote_id=rid, url=url, error=None)
+            creators.log(p["creator"], f"Scheduled on YouTube ({acc['name']}): {title}")
+        else:
+            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
+            creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
     except Exception as e:  # noqa: BLE001
         p["tries"] += 1
         p["error"] = str(e)[-300:]
-        if p["tries"] < 3 and clip and acc:
+        if isinstance(e, accounts.YouTubeScheduleUnconfirmed):
+            p.update(status="needs_review", remote_id=e.remote_id, url=f"https://studio.youtube.com/video/{e.remote_id}/edit")
+        elif p.get("publish_at") is not None:
+            p.update(status="failed", error=p["error"] + " Check YouTube Studio before retrying; the upload may have reached YouTube.")
+        elif p["tries"] < 3 and clip and acc:
             p.update(status="scheduled", due_at=time.time() + 600)  # try again in 10 minutes
         else:
             p["status"] = "failed"
@@ -143,6 +164,8 @@ def _run():
                         if p["status"] != "scheduled":
                             continue
                         p["status"] = "posting"
+                        _save()  # a restart must not silently repeat an upload that may have reached YouTube
+                    _mirror(p)
                     _post(p)
             except Exception:  # noqa: BLE001
                 pass
@@ -191,6 +214,8 @@ def retry(pid):
         p = next((p for p in _mine() if p["id"] == pid), None)
         if not p or p["status"] not in ("failed", "cancelled"):
             raise ValueError("Only failed or cancelled posts can be retried.")
+        if p.get("publish_at") is not None:
+            accounts.youtube_publish_time(p["publish_at"], lead=300)
         p.update(status="scheduled", due_at=time.time(), tries=0, error=None)
         _save()
     _mirror(p)
@@ -213,10 +238,10 @@ def overview() -> dict:
             "clips_today": sum(1 for k in clips if _day(k.get("made_at", 0)) == today), "clips_total": len(clips),
             "posted_today": sum(1 for p in ps if p["status"] == "posted" and _day(p["posted_at"]) == today),
             "posted_total": sum(1 for p in ps if p["status"] == "posted"),
-            "queued": sum(1 for p in ps if p["status"] in OPEN), "failed": sum(1 for p in ps if p["status"] == "failed"),
+            "queued": sum(1 for p in ps if p["status"] in OPEN + ON_YOUTUBE), "failed": sum(1 for p in ps if p["status"] == "failed"),
             "views": views, "earnings": round(views / 1000 * c["rate_per_1k"], 2)})
     names = {c["id"]: c["name"] for c in all_cs}
-    queue = sorted((p for p in _posts if p["status"] in OPEN), key=lambda p: p["due_at"])
+    queue = sorted((p for p in _posts if p["status"] in OPEN + ON_YOUTUBE), key=lambda p: p.get("publish_at") or p["due_at"])
     done = sorted((p for p in _posts if p["status"] in ("posted", "failed")), key=lambda p: -(p.get("posted_at") or p["due_at"]))[:15]
     show = [{**{k: v for k, v in p.items() if k != "user"}, "creator_name": names.get(p["creator"], "")} for p in queue + done]
     # last 14 days, oldest first, for the home graph

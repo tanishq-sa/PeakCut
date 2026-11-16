@@ -1663,10 +1663,17 @@ async function makeClips() {
 
 /* ============================================================ clips + jobs */
 function scoreCls(s) { return s >= 80 ? "s-hi" : s >= 60 ? "s-mid" : ""; }
+function postLabel(p) {
+  if (p.status === "youtube_scheduled") return `Scheduled on YouTube · ${new Date(p.publish_at * 1000).toLocaleString()}`;
+  if (p.status === "needs_review") return "Check YouTube Studio";
+  if (p.status === "posting") return p.publish_at ? "Uploading to YouTube — keep PeakCut open" : "Posting now";
+  if (p.status === "scheduled") return p.publish_at ? "Waiting to upload — keep PeakCut open" : clock(p.due_at);
+  return p.status === "posted" ? "Posted" : p.status === "failed" ? "Failed" : p.status;
+}
 function postPills(c) {
   return Object.values(c.posts || {}).filter(p => p.status !== "cancelled").map(p => {
-    const cls = p.status === "posted" ? "ok" : p.status === "failed" ? "bad" : "warn";
-    const txt = `${esc(p.account_name)} · ${p.status === "scheduled" ? clock(p.due_at) : p.status}`;
+    const cls = ["posted", "youtube_scheduled"].includes(p.status) ? "ok" : ["failed", "needs_review"].includes(p.status) ? "bad" : "warn";
+    const txt = `${esc(p.account_name)} · ${esc(postLabel(p))}`;
     return p.url ? `<a class="pill ${cls}" href="${esc(p.url)}" target="_blank" rel="noopener">${txt}</a>` : `<span class="pill ${cls}" title="${esc(p.error || "")}">${txt}</span>`;
   }).join("");
 }
@@ -1716,6 +1723,7 @@ function liveHtml(j) {
     <div class="meters">
       <div class="meter"><h4>Loudness, last minute</h4>${spark(L.level, "", -55, -8)}</div>
       ${L.chat ? `<div class="meter"><h4>Chat messages per second</h4>${spark(L.chat, "chat", 0, Math.max(4, ...L.chat))}</div>` : ""}
+      ${L.chat_status ? `<div class="meter"><h4>YouTube chat</h4><p class="sub">${esc(L.chat_status)}</p></div>` : ""}
       <div class="meter"><h4>Latest AI decisions</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${(L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
       <div class="meter"><h4>What was just said</h4><div class="said">${L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
     </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
@@ -1914,7 +1922,7 @@ function drawOverview() {
   const sum = k => o.creators.reduce((a, r) => a + r[k], 0);
   const d14 = k => (o.daily || []).reduce((a, d) => a + d[k], 0);
   const state = r => r.state === "recording" ? `<span class="pill live"><span class="dot"></span>Recording</span>` : r.state === "waiting" ? `<span class="pill warn">Waiting for live</span>` : `<span class="pill">Idle</span>`;
-  const pst = p => p.status === "posted" ? `<span class="pill ok">Posted</span>` : p.status === "failed" ? `<span class="pill bad">Failed</span>` : p.status === "posting" ? `<span class="pill warn">Posting now</span>` : `<span class="pill warn">${clock(p.due_at)}</span>`;
+  const pst = p => `<span class="pill ${["posted", "youtube_scheduled"].includes(p.status) ? "ok" : ["failed", "needs_review"].includes(p.status) ? "bad" : "warn"}">${esc(postLabel(p))}</span>`;
   const steps = nextSteps(o);
   put(box, `<div class="tiles">
       <div class="tile"><i>${ic("radio")}</i><b>${o.recording}</b><span>Recording now</span></div>
@@ -1935,11 +1943,11 @@ function drawOverview() {
       ${o.creators.length ? `<div class="scroll"><table><tr><th>Creator</th><th>Status</th><th>Auto-post</th><th class="num">Clips today</th><th class="num">Posted today</th><th class="num">Waiting</th><th class="num">Failed</th><th class="num">Views</th><th class="num">Est. $</th></tr>
       ${o.creators.map(r => `<tr><td><a class="lnk" href="#" data-act="go" data-v="c:${esc(r.id)}">${esc(r.name)}</a></td><td>${state(r)}</td><td>${r.autopost ? `<span class="pill ok">On</span>` : `<span class="pill">Off</span>`}</td><td class="num">${r.clips_today} <span class="sub">/ ${r.clips_total}</span></td><td class="num">${r.posted_today} <span class="sub">/ ${r.posted_total}</span></td><td class="num">${r.queued}</td><td class="num">${r.failed}</td><td class="num">${r.views.toLocaleString()}</td><td class="num">${r.earnings.toFixed(2)}</td></tr>`).join("")}</table></div>`
       : `<div class="empty"><img src="/brand/favicon.svg" alt=""><b>No creators yet</b>Add one to give each streamer their own workspace.</div>`}</div>
-    <div class="card"><div class="card-head"><div><h2>Post queue</h2><p class="sub">${o.paused ? "Paused. Recording and clipping carry on; nothing is posted." : "Queued clips go out at their scheduled time."}</p></div>
+    <div class="card"><div class="card-head"><div><h2>Post queue</h2><p class="sub">${o.paused ? "Local uploads are paused. Recording and clipping carry on." : "Local queues need PeakCut open. Confirmed YouTube schedules publish even when PeakCut is closed."} Manage confirmed schedules in YouTube Studio; pausing here does not pause them.</p></div>
         <button class="btn ${o.paused ? "primary" : ""}" data-act="pause">${ic(o.paused ? "play" : "pause")}${o.paused ? "Resume posting" : "Pause all posting"}</button></div>
       ${o.posts.length ? `<div class="scroll"><table class="stack"><tr><th>When</th><th>Clip</th><th>Creator</th><th>Account</th><th class="num">Views</th><th></th></tr>
       ${o.posts.map(p => `<tr><td data-l="Status">${pst(p)}</td><td data-l="Clip" class="c-main">${p.url ? `<a class="lnk" href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>` : esc(p.title)}${p.error ? `<div class="err" style="margin:2px 0 0">${esc(p.error)}</div>` : ""}</td><td data-l="Creator">${esc(p.creator_name || "None")}</td><td data-l="Account">${esc(p.account_name)}</td><td data-l="Views" class="num">${p.views ?? "–"}</td>
-        <td class="c-act" style="text-align:right">${p.status === "scheduled" ? `<button class="btn sm" data-act="pcancel" data-id="${p.id}">Cancel</button>` : p.status === "failed" ? `<button class="btn sm" data-act="pretry" data-id="${p.id}">Retry</button>` : ""}</td></tr>`).join("")}</table></div>`
+        <td class="c-act" style="text-align:right">${p.status === "scheduled" ? `<button class="btn sm" data-act="pcancel" data-id="${p.id}">Cancel</button>` : p.status === "failed" ? `<button class="btn sm" data-act="pretry" data-id="${p.id}">Retry</button>` : ["youtube_scheduled", "needs_review"].includes(p.status) && p.remote_id ? `<a class="btn sm" href="https://studio.youtube.com/video/${encodeURIComponent(p.remote_id)}/edit" target="_blank" rel="noopener">YouTube Studio</a>` : ""}</td></tr>`).join("")}</table></div>`
       : `<p class="help">Nothing queued or posted yet.</p>`}</div>`);
 }
 
@@ -2147,6 +2155,11 @@ function drawClipDlg(full) {
         ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
           <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
+        ${S.accounts.some(a => a.platform === "youtube") ? `<h3>Schedule on YouTube</h3>
+          <label class="f">Publish date and time<input type="datetime-local" id="youtube_publish_at" aria-describedby="youtube_schedule_help"></label>
+          <p class="help" id="youtube_schedule_help">Time zone: ${esc(Intl.DateTimeFormat().resolvedOptions().timeZone)}. Choose at least five minutes from now. Tick only the YouTube accounts above. The clip uploads privately now and becomes public at your chosen time.</p>
+          <button class="btn" data-act="postschedule">${ic("clock")}Upload and schedule on YouTube</button>
+          <p class="help">Keep PeakCut open until “Scheduled on YouTube” appears above. After that, YouTube publishes it even if PeakCut is closed. Change or cancel confirmed schedules in YouTube Studio.</p>` : ""}
         <div class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)">
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
           <button class="btn" data-act="copy" data-j="${j.id}" data-c="${esc(c.id)}">${ic("copy")}Copy post text</button></div>
@@ -2425,7 +2438,11 @@ document.addEventListener("click", async e => {
     if (a === "csave") return void await saveCreator();
     if (a === "cdiscard") { drawCreatorForm(); return toast("Changes discarded"); }
     if (a === "pause") { await send("/api/settings", {paused:!S.overview.paused}, "PUT"); return loadOverview(); }
-    if (a === "pcancel" || a === "pretry") { await api(`/api/posts/${d.id}/${a === "pcancel" ? "cancel" : "retry"}`, {method:"POST"}); return loadOverview(); }
+    if (a === "pcancel" || a === "pretry") {
+      const post = S.overview?.posts.find(p => p.id === d.id);
+      if (a === "pretry" && post?.publish_at && !await ask("Retry the YouTube upload?", "Check YouTube Studio first. If the video already arrived, uploading again could make a duplicate.", "Retry upload")) return;
+      await api(`/api/posts/${d.id}/${a === "pcancel" ? "cancel" : "retry"}`, {method:"POST"}); return loadOverview();
+    }
     if (a === "ssave") { await saveSettings(); toast("Saved", "ok"); return drawSettings(); }
     if (a === "plansave") {
       const p = {}; $$("#sform [data-plan]").forEach(i => { (p[i.dataset.plan] ??= {})[i.dataset.f] = Number(i.value); });
@@ -2440,12 +2457,23 @@ document.addEventListener("click", async e => {
       const body = {}; $$("#clipdlg [data-f]").forEach(i => body[i.dataset.f] = i.type === "number" ? Number(i.value) : i.value);
       await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
     }
-    if (a === "postnow" || a === "postqueue") {
+    if (a === "postnow" || a === "postqueue" || a === "postschedule") {
       const accs = $$("#clipdlg [data-pacc]:checked").map(i => i.value);
       if (!accs.length) return toast("Tick at least one account first.", "bad");
+      let publishAt = null;
+      if (a === "postschedule") {
+        const value = $("#youtube_publish_at").value;
+        publishAt = new Date(value).getTime() / 1000;
+        if (!value || !Number.isFinite(publishAt) || publishAt <= Date.now() / 1000 + 300) return toast("Choose a time at least five minutes from now.", "bad");
+        if (accs.some(id => S.accounts.find(x => x.id === id)?.platform !== "youtube")) return toast("Tick only YouTube accounts when scheduling a publishing time.", "bad");
+        if (!await ask("Schedule on YouTube?", `This uploads to ${accs.length} YouTube account${accs.length > 1 ? "s" : ""} now and makes the clip public on ${new Date(publishAt * 1000).toLocaleString()}. Keep PeakCut open until the upload is confirmed.`, "Upload and schedule")) return;
+      }
       if (a === "postnow" && !await ask("Post now?", `This clip goes to ${accs.length} account${accs.length > 1 ? "s" : ""} straight away.`, "Post now")) return;
-      await send("/api/posts", {job:D.jid, clip:D.cid, accounts:accs, now:a === "postnow"});
-      toast(a === "postnow" ? "Posting now" : "Added to the queue", "ok"); return tick();
+      b.disabled = true;
+      try {
+        await send("/api/posts", {job:D.jid, clip:D.cid, accounts:accs, now:a === "postnow", ...(publishAt != null ? {publish_at:publishAt} : {})});
+        toast(a === "postschedule" ? "Upload queued. Keep PeakCut open until Scheduled on YouTube appears." : a === "postnow" ? "Posting now" : "Added to the queue", "ok"); return tick();
+      } finally { b.disabled = false; }
     }
   } catch (err) { b.disabled = false; toast(err.message, "bad"); }
 });

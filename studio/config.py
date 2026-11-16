@@ -192,6 +192,10 @@ def ai_key() -> str:
     return _secret("PEAKCUT_AI_KEY", "PEAKCUT_AI_KEY_FILE", r"\S{8,}")
 
 
+def youtube_chat_key() -> str:
+    return _secret("PEAKCUT_YOUTUBE_CHAT_KEY", "PEAKCUT_YOUTUBE_CHAT_KEY_FILE")
+
+
 def ai_ready() -> bool:
     from . import ai
     return ai.ready()
