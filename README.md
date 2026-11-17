@@ -192,6 +192,27 @@ docker compose up -d --build
 - There are no limits on upload size, video length, recordings, creators or storage unless you set them in
   `.env`. Five videos can be sent at once. Request sizes are always capped, so junk can't fill the memory.
 
+## Speed settings
+
+Live transcription continues while the AI reviews a moment. Different recordings can make clips together,
+and each recording waits for its own clips before removing its buffer. Live words are saved in small pieces,
+with a complete checkpoint every minute and when recording ends; interrupted recordings can read both files.
+
+PeakCut chooses encoders for the operating system: Apple VideoToolbox on Mac, or NVIDIA NVENC followed by
+Intel Quick Sync on Windows and Linux, when FFmpeg includes them. It falls back to software encoding if the
+hardware cannot be used. No encoder setting is needed. Captions and layouts still need processor time.
+`PEAKCUT_RENDER_WORKERS` sets the total number of clips encoded together (default `2`), and
+`PEAKCUT_RENDER_THREADS` sets processor threads per encoder (default up to `4`). Put these in `.env` and restart
+after recording finishes. Smaller values can help keep a small machine responsive.
+
+Selecting part of a video extracts only that audio. Links also request only that part, with up to 38 seconds
+beside each end to line up downloaded clips. Clip and caption times keep their original video clock.
+
+Each job's `timings` in its saved `job.json` and API response records seconds spent downloading audio and video,
+extracting audio, transcribing, finding moments with AI, waiting in the clip queue, and rendering. Values add
+across clips and parallel tasks, so their sum can exceed elapsed time. Render time includes waiting for a shared
+encoder slot. Use these numbers to compare the same video and options before changing worker counts.
+
 ## Tests
 
 ```bash

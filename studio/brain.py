@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from . import ai, config, usage, roman
+from . import ai, config, usage, roman, work
 
 WINDOW_SEC, OVERLAP_SEC = 15 * 60, 60
 
@@ -165,6 +165,11 @@ def loud_zscore(db):
 
 
 def ask_ai(prompt, schema=None, purpose="AI call"):
+    with ai.operation():
+        return _ask_ai(prompt, schema, purpose)
+
+
+def _ask_ai(prompt, schema=None, purpose="AI call"):
     """Try each model in order, with a couple of retries for rate limits and overloads.
     Returns (the answer, the model that gave it, tokens used) and notes the tokens in the usage record."""
     if not config.ai_ready():
@@ -172,15 +177,21 @@ def ask_ai(prompt, schema=None, purpose="AI call"):
     last = None
     for model in ai.models():
         for attempt in range(3):
+            ai.remaining()
             try:
                 out, sent, wrote = ai.call(model, prompt, schema or SCHEMA)
                 usage.record(sent, wrote, purpose)
                 ai.clear_problem()
                 return out, model, sent + wrote
             except Exception as e:  # noqa: BLE001
+                work.check()
+                ai.remaining()
                 last = e
                 if "HTTP 429" in str(e) or "HTTP 5" in str(e):
-                    time.sleep(4 * (attempt + 1))
+                    if attempt == 2:
+                        break
+                    delay = getattr(e, "retry_after", None)
+                    ai.pause(delay if delay is not None else 4 * (attempt + 1))
                     continue
                 break
     ai.note_problem(last)

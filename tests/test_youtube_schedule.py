@@ -178,7 +178,156 @@ class YouTubeScheduleTests(unittest.TestCase):
         with patch.object(accounts, "youtube_upload", return_value=("id", "url")) as upload:
             posting._post(p)
         self.assertNotIn("publish_at", upload.call_args.kwargs)
+        self.assertEqual(p["status"], "youtube_processing")
+
+    def test_upload_progress_reaches_the_clip_and_is_saved(self):
+        p = self.queue()[0]
+        p["status"] = "posting"
+        def upload(*args, **kwargs):
+            kwargs["upload_state"].update(session="https://upload.example/private-session", size=100)
+            kwargs["on_progress"](40, 100, "uploading")
+            mirrored = self.clip["posts"][p["id"]]
+            self.assertEqual(mirrored["upload_bytes"], 40)
+            self.assertEqual(mirrored["upload_total"], 100)
+            self.assertNotIn("upload_state", mirrored)
+            self.assertEqual(json.loads(posting._FILE.read_text())[0]["upload_bytes"], 40)
+            return "remote01", "https://youtube.com/watch?v=remote01"
+        with patch.object(accounts, "youtube_upload", side_effect=upload):
+            posting._post(p)
+
+    def test_connection_failure_never_creates_an_automatic_second_upload(self):
+        p = posting.enqueue(self.job, self.clip, ["yt1"], now=True)[0]
+        with patch.object(accounts, "youtube_upload", side_effect=httpx.ReadTimeout("No reply")):
+            posting._post(p)
+        self.assertEqual(p["status"], "failed")
+        self.assertIn("YouTube Studio", p["error"])
+
+    def test_youtube_processing_becomes_posted_only_after_confirmation(self):
+        p = posting.enqueue(self.job, self.clip, ["yt1"], now=True)[0]
+        p.update(status="youtube_processing", remote_id="remote01")
+        with patch.object(accounts, "youtube_status", return_value={"remote01": {
+                "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+                "processingDetails": {"processingStatus": "succeeded"}}}):
+            posting._check_youtube([p])
         self.assertEqual(p["status"], "posted")
+        self.assertEqual(self.clip["posts"][p["id"]]["status"], "posted")
+
+    def test_processing_failure_keeps_the_video_id_and_reason(self):
+        p = posting.enqueue(self.job, self.clip, ["yt1"], now=True)[0]
+        p.update(status="youtube_processing", remote_id="remote01")
+        with patch.object(accounts, "youtube_status", return_value={"remote01": {
+                "status": {"uploadStatus": "failed", "failureReason": "invalidFile"},
+                "processingDetails": {"processingStatus": "failed"}}}):
+            posting._check_youtube([p])
+        self.assertEqual(p["status"], "needs_review")
+        self.assertIn("invalidFile", p["error"])
+        self.assertEqual(p["remote_id"], "remote01")
+
+    def test_processing_without_an_estimate_is_not_marked_as_posted(self):
+        p = posting.enqueue(self.job, self.clip, ["yt1"], now=True)[0]
+        p.update(status="youtube_processing", remote_id="remote01")
+        with patch.object(accounts, "youtube_status", return_value={"remote01": {
+                "status": {"uploadStatus": "uploaded"}, "processingDetails": {
+                    "processingStatus": "processing", "processingProgress": {"partsTotal": "0"}}}}):
+            posting._check_youtube([p])
+        self.assertEqual(p["status"], "youtube_processing")
+        self.assertNotIn("posted_at", p)
+
+    def test_processing_check_connection_error_is_visible_and_does_not_reupload(self):
+        p = posting.enqueue(self.job, self.clip, ["yt1"], now=True)[0]
+        p.update(status="youtube_processing", remote_id="remote01")
+        with patch.object(accounts, "youtube_status", side_effect=httpx.ReadTimeout("No reply")), \
+                patch.object(accounts, "youtube_upload") as upload:
+            posting._check_youtube([p])
+        self.assertEqual(p["status"], "youtube_processing")
+        self.assertIn("Will check again", p["error"])
+        upload.assert_not_called()
+
+    def test_upload_session_never_appears_in_the_activity_response(self):
+        p = self.queue()[0]
+        p["upload_state"] = {"session": "https://upload.example/private-session"}
+        with patch.object(posting.creators, "all_creators", return_value=[]), \
+                patch.object(jobs, "list_jobs", return_value=[]), \
+                patch.object(accounts, "settings", return_value=dict(accounts.SETTING_DEFAULTS)), \
+                patch.object(posting.live, "active_mine", return_value=[]):
+            self.assertNotIn("private-session", json.dumps(posting.overview()))
+
+
+class YouTubeUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory(dir=data.name)
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / "clip.mp4"
+        self.path.write_bytes(b"video-content")
+        self.acc = {"id": "yt1"}
+        token = patch.object(accounts, "_yt_token", return_value="test-token")
+        token.start(); self.addCleanup(token.stop)
+
+    def response(self, code, **kwargs):
+        return httpx.Response(code, request=httpx.Request("PUT", "https://upload.example/session"), **kwargs)
+
+    def upload(self, state, progress):
+        return accounts.youtube_upload(self.acc, self.path, "Title", "Description", [], "public",
+                                       upload_state=state, on_progress=lambda *args: progress.append(args))
+
+    def test_chunks_report_only_bytes_youtube_has_acknowledged(self):
+        self.path.write_bytes(b"x" * (2 * 1024 * 1024 + 9))
+        responses = [self.response(308, headers={"Range": "bytes=0-1048575"}),
+                     self.response(308, headers={"Range": "bytes=0-2097151"}),
+                     self.response(201, json={"id": "remote01"})]
+        progress, state = [], {}
+        with patch.object(accounts.httpx, "post", return_value=self.response(200, headers={"Location": "https://upload.example/session"})), \
+                patch.object(accounts.httpx, "put", side_effect=responses) as put:
+            self.assertEqual(self.upload(state, progress)[0], "remote01")
+        self.assertEqual([call.kwargs["headers"]["Content-Range"] for call in put.call_args_list],
+                         ["bytes 0-1048575/2097161", "bytes 1048576-2097151/2097161", "bytes 2097152-2097160/2097161"])
+        self.assertTrue(any(p[0] == 1048576 for p in progress))
+        self.assertEqual(progress[-1][0], self.path.stat().st_size)
+
+    def test_timeout_queries_the_same_session_and_resumes_from_server_offset(self):
+        responses = [httpx.ReadTimeout("No reply"), self.response(308, headers={"Range": "bytes=0-4"}),
+                     self.response(201, json={"id": "remote01"})]
+        progress, state = [], {}
+        with patch.object(accounts.httpx, "post", return_value=self.response(200, headers={"Location": "https://upload.example/session"})) as start, \
+                patch.object(accounts.httpx, "put", side_effect=responses) as put:
+            self.upload(state, progress)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(put.call_args_list[1].kwargs["headers"]["Content-Range"], "bytes */13")
+        self.assertEqual(put.call_args_list[2].kwargs["content"], b"-content")
+
+    def test_restart_uses_saved_session_instead_of_creating_another_video(self):
+        state = {"session": "https://upload.example/session", "size": 13}
+        with patch.object(accounts.httpx, "post") as start, patch.object(accounts.httpx, "put", side_effect=[
+                self.response(308, headers={"Range": "bytes=0-4"}), self.response(201, json={"id": "remote01"})]) as put:
+            self.upload(state, [])
+        start.assert_not_called()
+        self.assertEqual(put.call_args_list[1].kwargs["content"], b"-content")
+
+    def test_lost_final_reply_recovers_video_id_without_resending_file(self):
+        with patch.object(accounts.httpx, "post", return_value=self.response(200, headers={"Location": "https://upload.example/session"})), \
+                patch.object(accounts.httpx, "put", side_effect=[httpx.ReadTimeout("No reply"),
+                    self.response(201, json={"id": "remote01"})]) as put:
+            self.assertEqual(self.upload({}, [])[0], "remote01")
+        self.assertEqual(put.call_count, 2)
+        self.assertEqual(put.call_args_list[1].kwargs["content"], b"")
+
+    def test_stalled_connection_is_bounded_and_keeps_its_session(self):
+        state = {}
+        with patch.object(accounts.httpx, "post", return_value=self.response(200, headers={"Location": "https://upload.example/session"})) as start, \
+                patch.object(accounts.httpx, "put", side_effect=httpx.ReadTimeout("No reply")) as put:
+            with self.assertRaisesRegex(RuntimeError, "paused|resume|YouTube Studio"):
+                self.upload(state, [])
+        self.assertEqual(start.call_count, 1)
+        self.assertLessEqual(put.call_count, 5)
+        self.assertTrue(state.get("session"))
+
+    def test_changed_clip_is_not_spliced_into_an_existing_upload(self):
+        state = {"session": "https://upload.example/session", "size": 13, "mtime": -1}
+        with patch.object(accounts.httpx, "post") as post, patch.object(accounts.httpx, "put") as put:
+            with self.assertRaisesRegex(ValueError, "clip changed"):
+                self.upload(state, [])
+        post.assert_not_called()
+        put.assert_not_called()
 
 
 class ScheduleApiTests(unittest.TestCase):

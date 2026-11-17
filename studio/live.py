@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import httpx
 
-from . import alerts, auth, brain, config, creators, ctx, jobs, load, media, transcribe, usage
+from . import alerts, auth, brain, config, creators, ctx, jobs, load, media, timing, transcribe, transcript, usage
 
 SESSIONS: dict = {}
 SEG_SEC = 6           # length of each buffer piece
@@ -111,6 +111,11 @@ class Session:
         self.samples = 0              # total audio samples received
         self.db = []                  # loudness per second
         self.words = []
+        self._store = None
+        self.word_total = 0
+        self.keep_seconds = max(300, int(settings.get("buffer_min", 20)) * 60,
+                                int(settings.get("ai_every_min", 3) or 3) * 60 + 120)
+        self.db = transcript.Timeline(self.keep_seconds)
         self.t_done = 0.0             # transcript is complete up to this second
         self.segments = []            # (path, start, end) on the session clock
         self.seg_clock = 0.0
@@ -138,8 +143,18 @@ class Session:
         self.last_spike = -999.0      # when the last jump was sent to the AI (stream seconds)
         self.base = {}                # running averages the jumps are measured against, shown on the card
         self.spikes = 0
+        self._check_thread = None
+        self._check_lock = threading.Lock()
+        self._checkpoint_at = time.monotonic()
 
     # ---------------------------------------------------------------- recording
+    @property
+    def store(self):
+        if self._store is None:
+            self._store = transcript.LiveStore(self.dir)
+            self.word_total = self._store.count()
+        return self._store
+
     def start(self):
         SESSIONS[self.job["id"]] = self
         threading.Thread(target=ctx.bind(self._ingest), daemon=True).start()
@@ -380,18 +395,38 @@ class Session:
         if not hurry or n > SR * 24:
             # cut at the quietest moment between 4 and 6.5 s, so no word is split; the rest waits for the next pass
             _, cut = next(transcribe._chunks(audio, 4.0, 6.5))
-        words = transcribe.transcribe(audio[:cut])
+        words = timing.call(self.job, "transcription", transcribe.transcribe, audio[:cut])
         off = base / SR
         for w in words:
             w["s"], w["e"] = round(w["s"] + off, 2), round(w["e"] + off, 2)
         with self.lock:
             del self.pending[: cut * 2]
             self.pending_base += cut
-            self.words += words
             self.t_done = self.pending_base / SR
+        self._remember_words(words, self.t_done)
         self._triggers(words)
-        (self.dir / "words.json").write_text(json.dumps(self.words), encoding="utf-8")
+        if time.monotonic() - self._checkpoint_at >= 60:
+            self.store.checkpoint()
+            self._checkpoint_at = time.monotonic()
         return True
+
+    def _remember_words(self, words, now):
+        from bisect import bisect_left
+        self.store.append(self.word_total, words)
+        with self.lock:
+            self.word_total += len(words)
+            self.words.extend(words)
+            cut = bisect_left(self.words, now - self.keep_seconds, key=lambda w: w["s"])
+            del self.words[:cut]
+
+    def _words_between(self, start, end):
+        from bisect import bisect_left, bisect_right
+        with self.lock:
+            if self.words and start >= self.words[0]["s"]:
+                a = bisect_left(self.words, start, key=lambda w: w["s"])
+                b = bisect_right(self.words, end, key=lambda w: w["s"])
+                return self.words[a:b]
+        return self.store.between(start, end)
 
     AUTO_BEFORE, AUTO_AFTER, AUTO_GAP = 30, 20, 60   # seconds of stream sent around a jump; least time between jumps
     JUMP = 0.6                                        # 60% louder or busier than the last three minutes
@@ -428,6 +463,33 @@ class Session:
             self.last_spike = n
             self.spikes += 1
 
+    def _schedule_check(self, window=None, why=None, manual=False):
+        """One AI task per recording, with no growing queue of old checks."""
+        with self._check_lock:
+            if (self.user_stopped and not manual) or (self._check_thread and self._check_thread.is_alive()):
+                return False
+
+            def work():
+                try:
+                    if manual or not self.user_stopped:
+                        if manual:
+                            self._manual_step()
+                        else:
+                            timing.call(self.job, "ai", self._ai_check, window, why)
+                except Exception as e:  # noqa: BLE001
+                    self.job["ai"]["last_error"] = str(e)[-200:]
+                finally:
+                    jobs.save(self.job)
+
+            self.last_check = self.t_done if not manual else self.last_check
+            self._check_thread = threading.Thread(target=ctx.bind(work), daemon=True, name="live-judge")
+            self._check_thread.start()
+            return True
+
+    def _finish_checks(self):
+        if self._check_thread:
+            self._check_thread.join()
+
     def _ai_check(self, window=None, why=None):
         """Judge 1 reads only the words. If it finds a moment, judge 2 reads only the loudness and chat activity
         for the same stretch, without seeing the words. A clip is made when both say yes (or as set in Setup)."""
@@ -438,8 +500,7 @@ class Session:
         else:
             now = self.t_done
             ws = max(0.0, now - max(every, 3) * 60 - 90)  # each check overlaps the last by 90 s, so nothing falls between
-        self.last_check = self.t_done
-        win = [w for w in self.words if ws <= w["s"] <= now]
+        win = self._words_between(ws, now)
         recent = [c for c in self.job["clips"] if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
@@ -464,11 +525,11 @@ class Session:
         verdict["transcript"] = max((c["score"] for c in cands), default=0)
         if not keep:
             return self._verdict(verdict, "Words judge: nothing clip-worthy")
-        z = brain.loud_zscore(np.array(self.db, dtype=np.float32))
         lo, hi = int(ws), int(now) + 1
+        z = brain.loud_zscore(np.array(self.db[lo:hi], dtype=np.float32))
         chat = [self.chat.get(t, 0) for t in range(lo, hi)] if (self.chat_on or self.chat_total) else None
         try:
-            sig, tok2 = brain.judge_signals(z[lo:hi], chat, lo, now)
+            sig, tok2 = brain.judge_signals(z, chat, lo, now)
             self.checks += 1
             self.tokens += tok2
         except Exception as e:  # noqa: BLE001
@@ -492,7 +553,7 @@ class Session:
                                                      st["decide_mode"] == "either" else "Forced: no clip for a while")
             c["judges"] = {"words": c["score"], "reaction": rs or None, "why": why}
             c["reason"] = f"{c['reason']} ({why.lower()}.)"
-            self._add_clip(c)
+            self._add_clip(c, automatic=True)
             self._verdict(verdict, "Clipped: " + why.lower())
             added += 1
             must = False
@@ -531,7 +592,7 @@ class Session:
     def _manual_step(self):
         for req in [m for m in self.manual if m["end"] <= self.t_done or self.ended]:
             self.manual.remove(req)
-            text = " ".join(w["w"] for w in self.words if req["start"] <= w["s"] <= req["end"])
+            text = " ".join(w["w"] for w in self._words_between(req["start"], req["end"]))
             usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
             c = brain.describe(text, self.job["title"], self.job["uploader"])
             c.update(start=round(req["start"], 2), end=round(min(req["end"], self.samples / SR), 2), score=0)
@@ -539,14 +600,22 @@ class Session:
                 c["reason"] = req["why"]
             self._add_clip(c)
 
-    def _add_clip(self, c):
-        self.n += 1
-        c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
-                 status="queued", version=0, made_at=time.time())
+    def _add_clip(self, c, automatic=False):
         with self.lock:
+            if automatic and self.user_stopped:
+                return  # a reply received after Stop must not create another automatic clip
+            self.n += 1
+            c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
+                     status="queued", version=0, made_at=time.time())
             self.job["clips"].append(c)
         jobs.save(self.job)
-        jobs.submit_live(lambda: self._render(c))
+        queued_at = time.monotonic()
+
+        def render():
+            timing.add(self.job, "render_queue", time.monotonic() - queued_at)
+            self._render(c)
+
+        jobs.submit_live(render, lane=self.job["id"])
 
     def _render(self, clip):
         """Runs on the render worker: copy the needed buffer pieces, then make the clip."""
@@ -583,7 +652,7 @@ class Session:
         clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2))
         clip["start"] = max(clip["start"], clip["src_offset"])
         clip["end"] = min(clip["end"], clip["src_end"])
-        jobs.render_one(self.job, clip, list(self.words))
+        jobs.render_one(self.job, clip, self._words_between(clip["start"] - 1, clip["end"] + 1))
 
     def _align(self, src, guess, dur):
         """Where `src` really starts on the transcript clock. The video pieces and the audio feed keep separate
@@ -596,7 +665,7 @@ class Session:
             heard = transcribe.transcribe(media.load_audio(wav))
             wav.unlink(missing_ok=True)
             with self.lock:
-                near = [w for w in self.words if guess - 15 <= w["s"] <= guess + dur + 15]
+                near = self._words_between(guess - 15, guess + dur + 15)
             diffs = []
             for h in heard:
                 k = key(h["w"])
@@ -619,7 +688,10 @@ class Session:
 
     def _publish(self):
         elapsed = self.samples / SR
-        lines = brain.make_lines([w for w in self.words if w["s"] >= self.t_done - 45])[-5:]
+        lines = brain.make_lines(self._words_between(self.t_done - 45, self.t_done))[-5:]
+        for t in list(self.chat):
+            if t < elapsed - self.keep_seconds:
+                del self.chat[t]
         with self.lock:
             sec = int(elapsed)
             self.job.update(
@@ -628,7 +700,7 @@ class Session:
                       "lines": [l["text"] for l in lines], "level": [round(x) for x in self.db[-60:]],
                       "chat": [self.chat.get(t, 0) for t in range(max(0, sec - 60), sec)] if self.chat_on or self.chat_total else None,
                       "chat_status": self.chat_status,
-                      "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
+                      "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": self.word_total,
                       "rejected": self.rejected, "verdicts": list(reversed(self.verdicts)),
                       "every_min": int(self.settings.get("ai_every_min", 3)) or 3,
                       "auto": None,
@@ -650,7 +722,8 @@ class Session:
                     started = True
                     self.job.update(status="live", stage="Recording")
                     creators.log(cid, f"Recording started: {self.job['title']}")
-                self._manual_step()
+                if any(m["end"] <= self.t_done or self.ended for m in self.manual):
+                    self._schedule_check(manual=True)
                 # Three ways the AI is asked: on the creator's schedule (every N minutes), and always, when the
                 # stream suddenly gets louder or chat busier, or when someone says "clip".
                 every = int(self.settings.get("ai_every_min", 3)) or 3
@@ -659,13 +732,13 @@ class Session:
                 if self.user_stopped:
                     pass
                 elif said and (self.t_done >= said["t"] + self.SAID_AFTER or (self.ended and not busy)):
-                    self.said = None
-                    self._ai_check((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"])
+                    if self._schedule_check((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"]):
+                        self.said = None
                 elif sp and (self.t_done >= sp["t"] + self.AUTO_AFTER or (self.ended and not busy)):
-                    self.spike = None
-                    self._ai_check((sp["t"] - self.AUTO_BEFORE, sp["t"] + self.AUTO_AFTER), "Jump: " + sp["why"])
+                    if self._schedule_check((sp["t"] - self.AUTO_BEFORE, sp["t"] + self.AUTO_AFTER), "Jump: " + sp["why"]):
+                        self.spike = None
                 elif self.t_done - self.last_check >= every * 60 or (self.ended and not busy and self.t_done > self.last_check):
-                    self._ai_check()
+                    self._schedule_check()
                 self._publish()
             except Exception as e:  # noqa: BLE001
                 self.job["ai"]["last_error"] = str(e)[-200:]
@@ -673,6 +746,11 @@ class Session:
                 break
             if not busy:
                 time.sleep(2)
+        self._finish_checks()  # a late reply may have queued a render; cleanup must follow it
+        if self.ended and not self.user_stopped and self.t_done > self.last_check:
+            self._schedule_check()
+            self._finish_checks()
+        self.store.checkpoint()
         failed = bool(self.job.get("error")) and not started
         self.job.update(status="error" if failed else "done", stage="Could not record" if failed else self.end_note)
         jobs.save(self.job)
@@ -691,7 +769,7 @@ class Session:
             self.finished = True
             SESSIONS.pop(self.job["id"], None)
 
-        jobs.submit_live(cleanup)
+        jobs.submit_live(cleanup, lane=self.job["id"])
 
 
 def recover(job):
@@ -715,13 +793,14 @@ def recover(job):
                 s.seg_clock += dur
             s.csv_seen[i] = len(rows)
     try:
-        s.words = json.loads((s.dir / "words.json").read_text(encoding="utf-8"))
+        s.word_total = s.store.count()
+        s.words = s.store.between(max(0, s.seg_clock - s.keep_seconds), s.seg_clock)
     except Exception:  # noqa: BLE001
         s.words = []
     s.n = len(job["clips"])
     todo = [k for k in job["clips"] if k.get("status") == "queued"]
     for k in todo:
-        jobs.submit_live(lambda k=k: s._render(k))
+        jobs.submit_live(lambda k=k: s._render(k), lane=job["id"])
 
     def cleanup():
         for f in s.buf.glob("*"):
@@ -730,7 +809,7 @@ def recover(job):
         jobs.save(job)
         creators.log(job["creator"], f"Finished {len(todo)} clip(s) from a recording interrupted by a restart")
 
-    jobs.submit_live(cleanup)
+    jobs.submit_live(cleanup, lane=job["id"])
 
 
 def start_session(creator: dict, url=None) -> dict:

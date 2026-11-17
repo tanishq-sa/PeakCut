@@ -52,7 +52,7 @@ def json_text(x):
     return json.dumps(x)
 
 
-ai.httpx.post = fake_post
+ai._post = fake_post
 
 
 def use(provider, base=""):

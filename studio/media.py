@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from . import config
+from . import config, joblog
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -78,8 +78,9 @@ def site_allowed(url: str) -> bool:
 
 
 def run(cmd, cwd=None, timeout=3600):
+    from . import work
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        p = work.run(cmd, runner=subprocess.run, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", creationflags=NO_WINDOW, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{Path(str(cmd[0])).name} took too long and was stopped.")
@@ -89,17 +90,49 @@ def run(cmd, cwd=None, timeout=3600):
 
 
 class _Quiet:
-    def debug(self, m): pass
-    def info(self, m): pass
-    def warning(self, m): pass
-    def error(self, m): pass
+    def __init__(self):
+        self.job = joblog.current()
+
+    def debug(self, m):
+        if not m.startswith("[debug]"):
+            self.info(m)
+
+    def info(self, m):
+        joblog.write(m, job=self.job)
+
+    def warning(self, m):
+        joblog.write(m, "warning", job=self.job)
+
+    def error(self, m):
+        joblog.write(m, "error", job=self.job)
 
 
 def _ydl(opts):
     import yt_dlp
+    from . import work
+    work.check()
+    job = joblog.current()
+    label = "audio" if opts.get("format", "").startswith("ba") else "video"
+    last = [-1]
+    def log_progress(progress):
+        if job is None:
+            return
+        if progress.get("status") == "finished":
+            joblog.write(f"Downloading {label} finished; preparing the file", job=job)
+            last[0] = -1
+        elif progress.get("status") == "downloading":
+            total = progress.get("total_bytes") or progress.get("total_bytes_estimate")
+            if total:
+                percent = min(100, int(100 * progress.get("downloaded_bytes", 0) / total))
+                if percent // 10 > last[0]:
+                    last[0] = percent // 10
+                    joblog.write(f"Downloading {label}: {percent}%", job=job)
+    hooks = opts.get("progress_hooks", [])
+    opts = dict(opts, progress_hooks=[lambda progress: work.check(), log_progress, *hooks])
     # a channel or playlist link is answered as "a list" straight away, never walked video by video
-    return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
+    return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "noprogress": True, "no_warnings": False, "logger": _Quiet(),
                              "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
+                             "retries": 2, "fragment_retries": 2, "extractor_retries": 2,
                              "concurrent_fragment_downloads": 4, **opts})
 
 
@@ -242,15 +275,20 @@ def save_thumb(job_dir: Path, url: str = "", video: Path = None) -> bool:
     return False
 
 
-def download_audio(url: str, job_dir: Path, on_progress=None) -> Path:
+def download_audio(url: str, job_dir: Path, on_progress=None, start=0, end=None) -> Path:
     """Audio only: a few seconds even for long videos, and all the AI needs to pick clips."""
     def hook(d):
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
         if on_progress and d.get("status") == "downloading" and total:
             on_progress(d.get("downloaded_bytes", 0) / total)
 
-    with _youtube_guard(url), _ydl({"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(job_dir / "audio_src.%(ext)s"),
-               "progress_hooks": [hook]}) as ydl:
+    opts = {"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(job_dir / "audio_src.%(ext)s"),
+            "progress_hooks": [hook]}
+    if start or end:
+        from yt_dlp.utils import download_range_func
+        opts.update(download_ranges=download_range_func(None, [(start, end if end else float("inf"))]),
+                    force_keyframes_at_cuts=True)  # decode at the cut so its clock starts exactly at `start`
+    with _youtube_guard(url), _ydl(opts) as ydl:
         ydl.download([url])
     return _biggest(job_dir, "audio_src")
 
@@ -304,10 +342,12 @@ def probe(path: Path) -> dict:
     return {"width": w, "height": h, "duration": float(data["format"]["duration"])}
 
 
-def extract_audio(src: Path, wav: Path):
+def extract_audio(src: Path, wav: Path, start=0, end=None):
     # first_pts=0 pads any gap before the audio starts, so second 0 of the wav is second 0 of the file
     # -t: never more audio than the longest video allowed, whatever the file claims about itself
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", str(int(config.MAX_VIDEO_HOURS * 3600) + 60),
+    seek = ["-ss", str(start)] if start else []
+    duration = min(end - start, config.MAX_VIDEO_HOURS * 3600 + 60) if end else config.MAX_VIDEO_HOURS * 3600 + 60
+    run(["ffmpeg", "-y", "-v", "error", *seek, "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", str(duration),
          "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)])
 
 

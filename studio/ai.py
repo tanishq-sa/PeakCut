@@ -12,10 +12,119 @@ import json
 import os
 import re
 import threading
+import asyncio
+import atexit
+import contextlib
+import contextvars
+import concurrent.futures
+import time
+from email.utils import parsedate_to_datetime
 
 import httpx
 
-from . import config
+from . import config, work
+
+_deadline = contextvars.ContextVar("peakcut_ai_deadline", default=None)
+
+
+@contextlib.contextmanager
+def operation(seconds=None):
+    end = time.monotonic() + (float(config.env("PEAKCUT_AI_DEADLINE", "60")) if seconds is None else seconds)
+    previous = _deadline.get()
+    token = _deadline.set(min(previous, end) if previous is not None else end)
+    try:
+        yield
+    finally:
+        _deadline.reset(token)
+
+
+def remaining():
+    work.check()
+    end = _deadline.get()
+    left = end - time.monotonic() if end is not None else float(config.env("PEAKCUT_AI_DEADLINE", "60"))
+    if left <= 0:
+        raise TimeoutError("The AI request timed out. Try again.")
+    return left
+
+
+def pause(seconds):
+    if seconds >= remaining():
+        raise TimeoutError("The AI service asked for a delay longer than the remaining time. Try again later.")
+    work.wait(seconds)
+    remaining()
+
+
+class ConnectionPool:
+    """One reusable async HTTP pool; synchronous workers can cancel their own requests."""
+    def __init__(self, transport=None):
+        self.transport = transport
+        self.lock = threading.Lock()
+        self.loop = None
+        self.clients_created = 0
+
+    def start(self):
+        with self.lock:
+            if self.loop:
+                return
+            ready = threading.Event()
+
+            def run():
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.client = httpx.AsyncClient(transport=self.transport,
+                    limits=httpx.Limits(max_connections=16, max_keepalive_connections=8), follow_redirects=False)
+                self.clients_created += 1
+                ready.set()
+                self.loop.run_forever()
+                self.loop.close()
+
+            self.thread = threading.Thread(target=run, daemon=True, name="ai-http")
+            self.thread.start()
+            ready.wait()
+
+    def post(self, url, timeout, **kwargs):
+        self.start()
+
+        async def send():
+            return await asyncio.wait_for(self.client.post(url,
+                timeout=httpx.Timeout(timeout, connect=min(5, timeout), pool=min(5, timeout)), **kwargs), timeout)
+
+        future = asyncio.run_coroutine_threadsafe(send(), self.loop)
+        end = time.monotonic() + timeout
+        try:
+            while True:
+                work.check()
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("The AI request timed out. Try again.")
+                try:
+                    return future.result(timeout=min(.1, left))
+                except concurrent.futures.TimeoutError:
+                    if future.done():
+                        return future.result()
+        except BaseException:
+            future.cancel()
+            raise
+
+    def close(self):
+        with self.lock:
+            if not self.loop or not self.loop.is_running():
+                return
+            asyncio.run_coroutine_threadsafe(self.client.aclose(), self.loop).result(timeout=5)
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(5)
+            self.loop = None
+
+
+_pool = ConnectionPool()
+atexit.register(_pool.close)
+
+
+def _post(url, **kwargs):
+    timeout = min(float(kwargs.pop("timeout", 180)), remaining())
+    response = _pool.post(url, timeout=timeout, **kwargs)
+    remaining()
+    return response
 
 # name -> (label shown on the pages, address, how it is spoken to, where to get a key, an example model id)
 PROVIDERS = {
@@ -176,7 +285,9 @@ def test() -> dict:
 
 
 class AIError(RuntimeError):
-    pass
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 problem = {"text": "", "at": 0.0}       # why the AI last failed, for the dashboard; cleared when it answers again
@@ -210,7 +321,17 @@ def clear_problem():
 
 def _fail(r, model):
     text = r.text[:300].replace(key() or "\0", "<key>")
-    raise AIError(f"HTTP {r.status_code} {text}")
+    delay = None
+    retry = getattr(r, "headers", {}).get("Retry-After")
+    if retry:
+        try:
+            delay = max(0, float(retry))
+        except ValueError:
+            try:
+                delay = max(0, parsedate_to_datetime(retry).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    raise AIError(f"HTTP {r.status_code} {text}", retry_after=delay)
 
 
 # ---------------------------------------------------------------- the schema, said in words for chat models
@@ -248,13 +369,15 @@ def _parse(text):
 def call(model: str, prompt: str, schema: dict):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back)."""
     how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
+    with operation():
+        remaining()
+        return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
 
 
 def _gemini(model, prompt, schema):
     body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": schema}}
-    r = httpx.post(f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=120)
+    r = _post(f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=120)
     if r.status_code != 200:
         _fail(r, model)
     data = r.json()
@@ -271,7 +394,7 @@ def _openai(model, prompt, schema):
     extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
     for extra in extras:
-        r = httpx.post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=180)
+        r = _post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=180)
         if r.status_code not in (400, 422):
             break
     if r.status_code != 200:
@@ -283,7 +406,7 @@ def _openai(model, prompt, schema):
 
 def _anthropic(model, prompt, schema):
     body = {"model": model, "max_tokens": 8192, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}]}
-    r = httpx.post(f"{base_url()}/messages", json=body, timeout=180,
+    r = _post(f"{base_url()}/messages", json=body, timeout=180,
                    headers={"x-api-key": key(), "anthropic-version": "2023-06-01"})
     if r.status_code != 200:
         _fail(r, model)

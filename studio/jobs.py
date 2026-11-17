@@ -3,15 +3,20 @@ import collections
 import json
 import os
 import math
-import queue
 import shutil
 import threading
 import time
 import traceback
 import uuid
+import tempfile
 from pathlib import Path
 
-from . import brain, config, creators, ctx, load, media, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, joblog, load, media, render, roman, safe, timing, transcribe, transcript, usage, work
+from concurrent.futures import ThreadPoolExecutor
+
+_live_pool = ThreadPoolExecutor(max_workers=max(1, config.RENDER_WORKERS), thread_name_prefix="live-render")
+_live_lanes = {}
+_live_lock = threading.Lock()
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -101,7 +106,6 @@ class _FairQueue:
 
 
 _q = _FairQueue()
-_live_q: "queue.Queue" = queue.Queue()   # live clips never wait behind a long video
 _jobs: dict = {}
 _by_user: dict = {}                       # user -> {job id: job}: listing one person's videos never scans everyone's
 _lock = threading.RLock()
@@ -148,9 +152,10 @@ def public(job) -> dict:
     """What the browser may see: no server paths, no owner id."""
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
-    out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
+    out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for", "caption_words", "_render_ticket")} for c in job["clips"]]
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
+    out["logs"] = joblog.entries(job)
     if job.get("status") == "queued":
         n = _q.ahead().get(job["id"])
         if n:
@@ -180,7 +185,12 @@ def save(job):
 
 def _set(job, **kw):
     with _lock:
+        stage, error = job.get("stage"), job.get("error")
         job.update(kw)
+        if kw.get("stage") and kw["stage"] != stage:
+            joblog.write(kw["stage"], job=job, persist=False)
+        if kw.get("error") and kw["error"] != error:
+            joblog.write(kw["error"], "error", job=job, persist=False)
     save(job)
 
 
@@ -210,6 +220,11 @@ def _load_file(f: Path, uid: str):
         job.update(status="queued", stage="Picking up where it stopped", error=None, resume=True)
     if job.get("status") == "live":
         job.update(status="done", stage="Recording paused by a server update", was_live=True)
+    clips = job.get("clips", [])
+    if job.get("kind") != "live" and job.get("status") == "done" and clips and all(c.get("status") == "error" for c in clips):
+        job.update(status="error", stage="Could not make the clips",
+                   error=clips[0].get("error") or "No clips could be made. Open a clip to see what happened and try again.")
+        save(job)
     buffered = job.get("kind") == "live" and any((f.parent / "buffer").glob("*.ts"))
     for c in job.get("clips", []):
         if c.get("src"):
@@ -310,14 +325,23 @@ def submit(fn):
     _q.put(("fn", ctx.bind(fn), None))
 
 
-def submit_live(fn):
-    """Live-stream renders and cleanups: their own worker, so a long video can never hold them up."""
-    _live_q.put(ctx.bind(fn))
+def submit_live(fn, lane="default"):
+    """Different recordings can render together; each recording's cleanup still runs last."""
+    with _live_lock:
+        if lane in _live_lanes:
+            _live_lanes[lane].append(ctx.bind(fn))
+        else:
+            _live_lanes[lane] = collections.deque([ctx.bind(fn)])
+            _live_pool.submit(_drain_live, lane)
 
 
-def _live_worker():
+def _drain_live(lane):
     while True:
-        fn = _live_q.get()
+        with _live_lock:
+            if not _live_lanes[lane]:
+                del _live_lanes[lane]
+                return
+            fn = _live_lanes[lane].popleft()
         try:
             fn()
         except Exception:  # noqa: BLE001
@@ -335,9 +359,7 @@ def delete(jid):
     return bool(job)
 
 
-def request_render(jid, cid, changes: dict):
-    job = _jobs[jid]
-    clip = next(c for c in job["clips"] if c["id"] == cid)
+def edited_clip(clip, changes, duration=None):
     new = dict(clip)
     for k in ("start", "end"):
         if k in changes:
@@ -349,6 +371,29 @@ def request_render(jid, cid, changes: dict):
         raise ValueError("Those times aren't valid.")
     if not 3 <= new["end"] - new["start"] <= 180:
         raise ValueError("A clip can be 3 to 180 seconds long.")
+    if duration and new["end"] > duration:
+        raise ValueError("The clip ends after this video finishes.")
+    if "words" in changes:
+        words = changes["words"]
+        if not isinstance(words, list) or len(words) > 1000:
+            raise ValueError("Use at most 1000 caption words.")
+        cleaned, previous = [], -1
+        for word in words:
+            if not isinstance(word, dict):
+                raise ValueError("Each caption needs a word and two times.")
+            try:
+                start, end = float(word["s"]), float(word["e"])
+            except (ValueError, TypeError, KeyError):
+                raise ValueError("Caption times must be numbers.") from None
+            if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end <= start or start < previous - .01:
+                raise ValueError("Caption times must be in order and must not overlap.")
+            if duration and end > duration + .5:
+                raise ValueError("A caption ends after this video finishes.")
+            text = brain._text(word.get("w"), 80)
+            if text:
+                cleaned.append({"w": text, "s": round(start, 2), "e": round(end, 2)})
+            previous = end
+        new["caption_words"] = cleaned
     for k in ("hook", "title", "description", "style", "layout"):
         if k in changes:
             new[k] = str(changes[k])[:{"hook": 60, "title": 100, "description": 2000}.get(k, 20)]
@@ -356,15 +401,66 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
-    clip.update(new, status="queued")
+    return new
+
+
+def request_render(jid, cid, changes: dict):
+    job = _jobs[jid]
+    clip = next(c for c in job["clips"] if c["id"] == cid)
+    new = edited_clip(clip, changes, job.get("duration"))
+    with _lock:
+        work.cancel((jid, cid))
+        clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
 
 
+def cancel(jid, cid=None):
+    job = get(jid)
+    if not job:
+        raise ValueError("No such video")
+    with _lock:
+        if cid:
+            clip = next((c for c in job["clips"] if c["id"] == cid), None)
+            if not clip:
+                raise ValueError("No such clip")
+            targets = [clip]
+        else:
+            work.cancel((jid, None))
+            targets = job["clips"]
+            job.update(status="cancelled", stage="Stopped by you", error=None)
+        for clip in targets:
+            if clip.get("status") in ("queued", "rendering"):
+                work.cancel((jid, clip["id"]))
+                clip.update(status="error", error="Stopped by you. Save and re-make to try again.")
+    joblog.write(f"{cid}: stopped by you" if cid else "Processing stopped by you", job=job, persist=False)
+    save(job)
+
+
 def render_one(job, clip, words):
+    if job.get("status") == "cancelled":
+        return
+    ticket = uuid.uuid4().hex
+    try:
+        with joblog.capture(job), work.task((job["id"], clip["id"]), timeout=CLIP_MINUTES * 60):
+            with _lock:
+                work.check()
+                clip["_render_ticket"] = ticket
+            _render_one(job, clip, words)
+    except work.Cancelled:
+        with _lock:
+            if clip.get("_render_ticket") == ticket and clip.get("status") == "rendering":
+                clip.update(status="error", error="This clip was stopped. Save and re-make to try again.")
+                joblog.write(f"{clip['id']}: clip stopped", "warning", job=job, persist=False)
+                save(job)
+
+
+def _render_one(job, clip, words):
     d = Path(job["dir"])
     clip["status"] = "rendering"
+    joblog.write(f"{clip['id']}: making captions and rendering the clip", job=job, persist=False)
     save(job)
+    target, clip = clip, dict(clip)
     try:
         off = clip.get("src_offset", 0.0)
         src = Path(clip["src"]) if clip.get("src") else Path(job["source_path"])
@@ -372,7 +468,9 @@ def render_one(job, clip, words):
             clip["end"] = min(clip["end"], job["duration"])
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
         span = [round(clip["start"], 2), round(clip["end"], 2), "en2"]      # "en2": captions made always-English
-        if clip.get("fixed_for") == span and clip.get("fixed_words") and not any(
+        if "caption_words" in clip:
+            raw = clip["caption_words"]
+        elif clip.get("fixed_for") == span and clip.get("fixed_words") and not any(
                 roman.needs_roman(w.get("w", "")) for w in clip["fixed_words"]):
             raw = clip["fixed_words"]          # already tidied for this exact span: no second AI call
         else:
@@ -382,25 +480,38 @@ def render_one(job, clip, words):
                 raw = brain.english_captions(raw, job.get("lang") or "", job.get("title") or "",
                                              youtube_english=lambda: _english_part(job, clip))
                 clip.update(fixed_words=raw, fixed_for=span)
-            except Exception:  # noqa: BLE001 - captions still render with the words as heard
+            except Exception as e:  # noqa: BLE001 - captions still render with the words as heard
+                work.check()
+                joblog.write(f"{clip['id']}: caption cleanup failed; using the original words. {e}", "warning", job=job)
                 pass
         # the last word on it: whatever was said, nothing is drawn in Hindi or Urdu script
         near = [dict(w, s=w["s"] - off, e=w["e"] - off) for w in roman.words(raw)]
-        out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
-        clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
-        post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
-        (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="render-", dir=d) as staged:
+            out = timing.call(job, "render", render.render_clip, src, Path(staged), clip["id"], local, near, job["width"], job["height"])
+            with _lock:
+                work.check()
+                for path in Path(staged).iterdir():
+                    path.replace(d / "clips" / path.name)
+                clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
+                target.update(clip)
+                joblog.write(f"{clip['id']}: clip ready ({clip.get('encoder') or 'video saved'})", job=job, persist=False)
+                post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
+                (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
         if clip["version"] == 1:
-            clip.setdefault("made_at", time.time())
+            target.setdefault("made_at", time.time())
             creators.log(job["creator"], f"Clip ready (score {clip['score']}): {clip['title'] or clip['hook']}")
             save(job)
             for fn in on_clip_ready:
                 try:
-                    fn(job, clip)
+                    fn(job, target)
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
+    except work.Cancelled:
+        raise
     except Exception as e:  # noqa: BLE001
-        clip.update(status="error", error=safe.friendly(e, 400))
+        work.check()
+        target.update(status="error", error=safe.friendly(e, 400))
+        joblog.write(f"{clip['id']}: {e}", "error", job=job, persist=False)
         creators.log(job["creator"], f"Clip failed: {safe.friendly(e, 200)}")
     save(job)
 
@@ -408,28 +519,45 @@ def render_one(job, clip, words):
 CLIP_MINUTES = float(config.env("PEAKCUT_CLIP_MINUTES", "15"))     # the longest one clip may take to make
 
 
-def _wait_for_clips(job, futures, began, workers):
+def _wait_for_clips(job, futures, began, workers, video=None):
     """Wait for a video's clips, but not for ever. A clip that hangs (a download that stalls, an encoder that
     freezes) used to keep the whole video "in progress", and no other clip could be re-made. Now it is marked as
     failed after CLIP_MINUTES and the video finishes with the clips that did work."""
     left, given_up = list(futures), 0
     late = "This clip took too long and was stopped. Open it and press Save and re-make to try again."
     while left:
+        work.check()
         still = []
         for f, clip in left:
             if f.done():
-                f.result()
+                try:
+                    f.result()
+                except work.Cancelled:
+                    pass
                 continue
             t = began.get(clip["id"])
             if (t and time.time() - t > CLIP_MINUTES * 60) or (not t and given_up >= workers):
                 given_up += 1
+                work.cancel((job["id"], clip["id"]))
+                f.cancel()
                 clip.update(status="error", error=late)
+                joblog.write(f"{clip['id']}: {late}", "error", job=job, persist=False)
                 creators.log(job["creator"], f"Clip stopped after {CLIP_MINUTES:g} minutes: {clip.get('title') or clip.get('hook') or clip['id']}")
                 save(job)
                 continue
             still.append((f, clip))
         left = still
         if left:
+            finished = len(futures) - len(left)
+            ready = sum(c.get("status") == "done" for _, c in futures)
+            failed = sum(c.get("status") == "error" for _, c in futures)
+            stage = "Downloading the video" if video is not None and not video.done() else "Finishing the clips"
+            stage += f" · {finished} of {len(futures)} finished"
+            if ready or failed:
+                stage += f" ({ready} ready, {failed} failed)"
+            progress = max(job.get("progress", .92), .92 + .07 * finished / len(futures))
+            if job.get("stage") != stage or job.get("progress") != progress:
+                _set(job, stage=stage, progress=progress)
             time.sleep(1)
 
 
@@ -453,10 +581,11 @@ LONG_VIDEO = 40 * 60   # above this, fetch only the pieces that become clips
 PAD = 8                # seconds kept either side of a fetched piece, so clips can be re-trimmed
 
 
-def _fetch_piece(job, clip, full_audio):
+def _fetch_piece(job, clip, full_audio, audio_start=0):
     """Long videos: download just this clip's stretch and pin down exactly where it starts."""
     d = Path(job["dir"])
     o = job["options"]
+    joblog.write(f"{clip['id']}: downloading this part of the video", job=job)
     try:
         want = max(0.0, clip["start"] - PAD)
         piece = media.download_section(job["source"]["url"], d / "clips", f"{clip['id']}.src", want,
@@ -466,13 +595,14 @@ def _fetch_piece(job, clip, full_audio):
         part = media.load_audio(wav)
         wav.unlink(missing_ok=True)
         meta = media.probe(piece)
-        off = media.find_offset(full_audio, part, want)
+        off = audio_start + media.find_offset(full_audio, part, want - audio_start)
         clip.update(src=str(piece), src_offset=round(off, 2), src_end=round(off + meta["duration"], 2))
         clip["start"], clip["end"] = max(clip["start"], clip["src_offset"]), min(clip["end"], clip["src_end"])
         job.setdefault("width", meta["width"])
         job.setdefault("height", meta["height"])
     except Exception as e:  # noqa: BLE001
         clip.update(status="error", error=f"Could not fetch this part of the video: {safe.friendly(e, 250)}")
+        joblog.write(f"{clip['id']}: could not download this part. {e}", "error", job=job)
 
 
 BLOCK = 10 * 60         # long videos are transcribed and clipped one block at a time
@@ -488,6 +618,13 @@ def _covers(words: list, start: float, end: float) -> bool:
 
 
 def _run_job(job):
+    if job.get("status") == "cancelled":
+        return
+    with joblog.capture(job), work.task((job["id"], None)):
+        return _run_pipeline(job)
+
+
+def _run_pipeline(job):
     import math
     from concurrent.futures import ThreadPoolExecutor
     d = Path(job["dir"])
@@ -495,6 +632,9 @@ def _run_job(job):
     src = job["source"]
     t0 = time.time()
     notes = []
+    def note(message):
+        notes.append(message)
+        joblog.write(message, job=job)
     usage.set_context(job["creator"], job["title"] or src.get("name"))
     resuming = bool(job.pop("resume", False)) and (d / "words.json").is_file()
     if resuming:   # after a restart: keep the transcript parts, clips and AI answers already made, and carry on
@@ -508,6 +648,8 @@ def _run_job(job):
         _set(job, stage="Getting the audio")
     fetch = ThreadPoolExecutor(1)
     video = None
+    audio_start = float(o["range_start"] or 0)
+    audio_end = float(o["range_end"]) if o["range_end"] else None
     if src["type"] == "url":
         meta = media.info(src["url"])
         if meta["kind"] != "video":
@@ -522,10 +664,16 @@ def _run_job(job):
             _set(job, thumb=True)
         usage.set_context(job["creator"], meta["title"])
         span = (o["range_end"] or meta["duration"]) - (o["range_start"] or 0)
-        pieces = span > LONG_VIDEO or meta["duration"] <= 0
+        pieces = span > LONG_VIDEO or meta["duration"] <= 0 or bool(audio_start or audio_end)
+        if audio_start or audio_end:
+            # Keep enough sound beside the selection to align downloaded video pieces.
+            audio_start = max(0.0, audio_start - PAD - 30)
+            if audio_end:
+                audio_end = min(meta["duration"], audio_end + PAD + 30) if meta["duration"] else audio_end + PAD + 30
         if not pieces:  # shorter video: fetch all of it in the background while the audio is worked on
-            video = fetch.submit(media.download, src["url"], d, int(o["quality"]))
-        audio_file = media.download_audio(src["url"], d, lambda p: _set(job, progress=0.03 + 0.1 * p))
+            video = fetch.submit(ctx.bind(timing.call), job, "video_download", media.download, src["url"], d, int(o["quality"]))
+        audio_file = timing.call(job, "audio_download", media.download_audio, src["url"], d,
+                                 lambda p: _set(job, progress=0.03 + 0.1 * p), start=audio_start, end=audio_end)
     else:
         pieces, audio_file = False, Path(src["path"])
         info = media.probe(audio_file)
@@ -535,33 +683,36 @@ def _run_job(job):
         if not job.get("thumb") and media.save_thumb(d, video=audio_file):
             _set(job, thumb=True)
     wav = d / "audio.wav"
-    media.extract_audio(audio_file, wav)
+    if src["type"] == "url":
+        timing.call(job, "audio_extract", media.extract_audio, audio_file, wav)
+    else:
+        timing.call(job, "audio_extract", media.extract_audio, audio_file, wav, start=audio_start, end=audio_end)
     audio = media.load_audio(wav)
     wav.unlink(missing_ok=True)
     if src["type"] == "url":
         audio_file.unlink(missing_ok=True)
     if not job["duration"]:
-        job["duration"] = len(audio) / 16000
-    lo = int((o["range_start"] or 0) * 16000)
-    hi = min(len(audio), int(o["range_end"] * 16000)) if o["range_end"] else len(audio)
+        job["duration"] = audio_start + len(audio) / 16000
+    lo = int(((o["range_start"] or 0) - audio_start) * 16000)
+    hi = min(len(audio), int((o["range_end"] - audio_start) * 16000)) if o["range_end"] else len(audio)
+    if hi <= lo:
+        raise ValueError("There is no audio in the selected part of the video.")
     span = (hi - lo) / 16000
     db = media.loudness_per_second(audio[lo:hi])
 
     vlock, vstate = threading.Lock(), {}
 
     def whole_video():
-        """Wait for the background download once; retry it, or give up and use pieces."""
+        """Share one download result. The downloader already retries; if it fails, try clip pieces."""
         with vlock:
             if "path" not in vstate:
                 path = None
                 try:
                     path = video.result()
+                except work.Cancelled:
+                    raise
                 except Exception as e:  # noqa: BLE001 - sites sometimes refuse a download
-                    notes.append(f"Video download refused once ({str(e)[-80:]}), retrying")
-                    try:
-                        path = media.download(src["url"], d, int(o["quality"]))
-                    except Exception as e2:  # noqa: BLE001
-                        notes.append(f"Whole-video download failed ({str(e2)[-80:]}), fetching clip parts instead")
+                    note(f"Whole-video download failed ({e}), fetching clip parts instead")
                 if path:
                     info = media.probe(path)
                     job.update(source_path=str(path), width=info["width"], height=info["height"])
@@ -572,20 +723,27 @@ def _run_job(job):
 
     began = {}      # clip id -> when work on it started
 
-    def make(clip, words_now):
+    def make(clip, words_now, queued_at):
+        if clip.get("status") == "error" or job.get("status") == "cancelled":
+            return
+        with work.task((job["id"], clip["id"]), timeout=CLIP_MINUTES * 60):
+            make_current(clip, words_now, queued_at)
+
+    def make_current(clip, words_now, queued_at):
+        timing.add(job, "render_queue", time.monotonic() - queued_at)
         began[clip["id"]] = time.time()
         if src["type"] == "url" and (pieces or not whole_video()):
-            _fetch_piece(job, clip, audio)
+            timing.call(job, "video_download", _fetch_piece, job, clip, audio, audio_start=audio_start)
         if clip["status"] != "error" and yt and yt[1].lower().startswith("en"):
             # The clip was found with YouTube's transcript. What is shown on screen comes from our own model,
             # run on just this clip: full punctuation, nothing blanked out, timings to the word.
-            a0, b0 = max(lo, int((clip["start"] - 1.5) * 16000)), min(hi, int((clip["end"] + 1.5) * 16000))
+            a0, b0 = max(lo, int((clip["start"] - audio_start - 1.5) * 16000)), min(hi, int((clip["end"] - audio_start + 1.5) * 16000))
             try:
-                tw = [dict(w, s=round(w["s"] + a0 / 16000, 2), e=round(w["e"] + a0 / 16000, 2)) for w in transcribe.transcribe(audio[a0:b0])]
+                tw = [dict(w, s=round(w["s"] + audio_start + a0 / 16000, 2), e=round(w["e"] + audio_start + a0 / 16000, 2)) for w in timing.call(job, "transcription", transcribe.transcribe, audio[a0:b0])]
             except Exception:  # noqa: BLE001 - the clip is still made, with YouTube's words
                 tw = []
             if len(tw) >= 3:
-                exact[clip["id"]] = (a0 / 16000, b0 / 16000, tw)
+                exact[clip["id"]] = (audio_start + a0 / 16000, audio_start + b0 / 16000, tw)
                 words_now = tw
         if clip["status"] != "error":
             render_one(job, clip, words_now)
@@ -603,7 +761,7 @@ def _run_job(job):
             yt = media.youtube_words(src["url"])
         except Exception:  # noqa: BLE001 - no transcript to borrow: ours is written as usual
             yt = None
-        if yt and not _covers(yt[0], lo / 16000, hi / 16000):
+        if yt and not _covers(yt[0], audio_start + lo / 16000, audio_start + hi / 16000):
             yt = None
         job["transcript_from"] = "youtube" if yt else "own"
         job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
@@ -615,12 +773,12 @@ def _run_job(job):
         done_blocks = min(int(job.get("done_blocks", 0)), len(blocks)) if words else 0
         tokens, model = int((job.get("ai") or {}).get("tokens", 0)), (job.get("ai") or {}).get("model")
         if done_blocks < len(blocks):     # words past the last finished part are transcribed again
-            cut = blocks[done_blocks][0] / 16000
+            cut = audio_start + blocks[done_blocks][0] / 16000
             words = [w for w in words if w["s"] < cut]
         for c in job["clips"]:            # clips found before the restart that were not finished yet
             if c.get("status") not in ("done", "error"):
                 c["status"] = "queued"
-                futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+                futures.append((renders.submit(ctx.bind(make), c, list(words), time.monotonic()), c))
         save(job)
     # The transcript of the next part is written while the AI is still reading this one (the AI is a wait on the
     # network, the transcript is work on this machine), so neither waits for the other.
@@ -636,16 +794,17 @@ def _run_job(job):
                 if now_on[0] == i and p - last[0] > 0.05:      # only the part being shown moves the bar
                     last[0] = p
                     _set(job, progress=max(job["progress"], 0.14 + 0.78 * ((a_ - lo) + p * (b_ - a_)) / max(1, hi - lo)))
-            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp)
+            heard[i] = ahead.submit(ctx.bind(timing.call), job, "transcription", transcribe.transcribe, audio[a_:b_], tp)
 
     for bi, (a, b) in enumerate(blocks):
+        work.check()
         if bi < done_blocks:
             continue                      # transcribed and checked by the AI before the restart
-        shift = a / 16000
+        shift = audio_start + a / 16000
         where = f" (minute {round((a - lo) / 16000 / 60)} of {round(span / 60)})" if len(blocks) > 1 else ""
         if yt:
             _set(job, stage="Reading the transcript" + where)
-            bw = [dict(w, s=round(w["s"] - shift, 2), e=round(w["e"] - shift, 2)) for w in yt[0] if a / 16000 <= w["s"] < b / 16000]
+            bw = [dict(w, s=round(w["s"] - shift, 2), e=round(w["e"] - shift, 2)) for w in yt[0] if shift <= w["s"] < audio_start + b / 16000]
         else:
             _set(job, stage="Writing the transcript" + where)
             now_on[0] = bi
@@ -663,23 +822,24 @@ def _run_job(job):
             continue
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
-        found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append)
+        found, ai = timing.call(job, "ai", brain.find_clips, bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
+                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), note)
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
-            notes.append(ai["note"])
+            note(ai["note"])
         for c in found:
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"], status="queued", version=0)
             job["clips"].append(c)
-            futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+            joblog.write(f"{c['id']}: moment found at {c['start']:g}–{c['end']:g} seconds; queued for rendering", job=job)
+            futures.append((renders.submit(ctx.bind(make), c, list(words), time.monotonic()), c))
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
         job["done_blocks"] = bi + 1       # a restart from here on carries on with the next part
         save(job)
     if futures:
         _set(job, stage="Finishing the clips", progress=max(job["progress"], 0.92))
-    _wait_for_clips(job, futures, began, renders._max_workers)
+    _wait_for_clips(job, futures, began, renders._max_workers, video=video)
     if exact:           # keep our own words for the clips in the saved transcript, so editing a clip later uses them
         for a_s, b_s, tw in exact.values():
             words = [w for w in words if not a_s <= w["s"] < b_s] + tw
@@ -692,16 +852,26 @@ def _run_job(job):
     clips = job["clips"]
     job["ai"] = {"model": model, "tokens": tokens, "log": notes[-5:],
                  "note": "The AI was unavailable, so clips were picked by loudness only." if clips and not model else ""}
+    ready = sum(c.get("status") == "done" for c in clips)
+    failed = [c for c in clips if c.get("status") == "error"]
+    status, error = "done", None
     stage = "Done" if clips else "Done, but nothing clip-worthy was found"
-    _set(job, status="done", stage=stage, progress=1.0, took=round(time.time() - t0))
+    if failed:
+        if ready:
+            stage = f"Done · {ready} clip{'s' if ready != 1 else ''} ready, {len(failed)} could not be made"
+        else:
+            status, stage = "error", "Could not make the clips"
+            error = failed[0].get("error") or "No clips could be made. Open a clip to see what happened and try again."
+    _set(job, status=status, stage=stage, error=error, progress=1.0, took=round(time.time() - t0))
     try:
         from . import notices
         name = job.get("title") or job["source"].get("name") or "your video"
-        notices.add(job.get("user"), "clips", f"{len(clips)} clip{'s' if len(clips) != 1 else ''} ready" if clips else "Nothing clip-worthy found",
+        notice = f"{ready} clip{'s' if ready != 1 else ''} ready" if ready else "Could not make the clips" if failed else "Nothing clip-worthy found"
+        notices.add(job.get("user"), "clips", notice,
                     name, f"/app/creators/{job['creator']}" if job.get("creator") else "/app/videos")
     except Exception:  # noqa: BLE001
         pass
-    creators.log(job["creator"], f"Video finished with {len(clips)} clips in {round(time.time() - t0)}s: {job['title']}")
+    creators.log(job["creator"], f"Video finished with {ready} clips ready and {len(failed)} failed in {round(time.time() - t0)}s: {job['title']}")
 
 
 def _worker(quick_only=False):
@@ -723,10 +893,15 @@ def _worker(quick_only=False):
             if kind == "job":
                 _run_job(job)
             else:
-                words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+                words = transcript.read(job["dir"])
                 clip = next(c for c in job["clips"] if c["id"] == cid)
-                render_one(job, clip, words)
+                if clip.get("status") == "queued":
+                    render_one(job, clip, words)
+        except work.Cancelled:
+            if job.get("status") != "cancelled":
+                _set(job, status="cancelled", stage="Stopped", error=None)
         except Exception as e:  # noqa: BLE001
+            joblog.write(f"{type(e).__name__}: {e}", "error", job=job)
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
             if kind == "job":
                 for c in job["clips"]:
@@ -759,4 +934,3 @@ def start():
     for _ in range(max(1, config.JOB_WORKERS)):
         threading.Thread(target=_worker, daemon=True).start()
     threading.Thread(target=_worker, args=(True,), daemon=True).start()   # re-making a single clip never waits behind whole videos
-    threading.Thread(target=_live_worker, daemon=True).start()

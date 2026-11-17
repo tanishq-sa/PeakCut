@@ -103,7 +103,7 @@ def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
     return Reply(200, {"candidates": [{"content": {"parts": [{"text": '["ok"]'}]}}], "usageMetadata": {"promptTokenCount": 9, "totalTokenCount": 12}})
 
 
-ai.httpx.get, ai.httpx.post = fake_get, fake_post
+ai.httpx.get, ai._post = fake_get, fake_post
 post = lambda path, body=None: c.post(path, json=body or {}, headers=ORIGIN)  # noqa: E731
 r = post("/api/ai/models", {"provider": "gemini", "key": KEY})
 check("models are listed with a key typed but not saved yet", (r.status_code, r.json().get("models")), (200, ["g-fast"]))

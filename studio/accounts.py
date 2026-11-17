@@ -360,8 +360,10 @@ class YouTubeScheduleUnconfirmed(ValueError):
         self.remote_id = remote_id
 
 
-def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str, publish_at=None):
-    if publish_at is not None:
+def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str, publish_at=None,
+                   upload_state=None, on_progress=None):
+    state = upload_state if upload_state is not None else {}
+    if publish_at is not None and not state.get("session"):
         publish_at = youtube_publish_time(publish_at)
     token = _yt_token(acc)
     meta = {"snippet": {"title": re.sub(r"[<>]", "", title)[:100] or "Clip", "description": re.sub(r"[<>]", "", description)[:4900],
@@ -370,14 +372,72 @@ def youtube_upload(acc, path: Path, title: str, description: str, tags: list, pr
     if publish_at is not None:
         meta["status"].update(privacyStatus="private", publishAt=datetime.fromtimestamp(publish_at, timezone.utc).isoformat().replace("+00:00", "Z"))
     size = path.stat().st_size
-    start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
-                              params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
-                              headers={"Authorization": f"Bearer {token}", "X-Upload-Content-Type": "video/mp4",
-                                       "X-Upload-Content-Length": str(size)}, timeout=60), "Starting the YouTube upload")
-    with path.open("rb") as f:
-        done = _check(httpx.put(start.headers["Location"], content=f.read(),
-                                headers={"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}, timeout=900),
-                      "Uploading to YouTube").json()
+    if size <= 0:
+        raise ValueError("This clip's video file is empty. Re-make the clip before uploading.")
+    if state.get("session") and state.get("size") != size:
+        raise ValueError("The clip changed after the upload started. Check YouTube Studio before starting another upload.")
+    if state.get("mtime") is not None and state["mtime"] != path.stat().st_mtime_ns:
+        raise ValueError("The clip changed after the upload started. Check YouTube Studio before starting another upload.")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}
+    def progress(sent, stage):
+        state["sent"] = sent
+        if on_progress:
+            on_progress(sent, size, stage)
+    querying = bool(state.get("session"))
+    if not querying:
+        start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
+                                  params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
+                                  headers={"Authorization": f"Bearer {token}", "X-Upload-Content-Type": "video/mp4",
+                                           "X-Upload-Content-Length": str(size)}, timeout=30), "Starting the YouTube upload")
+        state.update(session=start.headers["Location"], size=size, mtime=path.stat().st_mtime_ns, sent=0)
+    progress(state.get("sent", 0), "checking" if querying else "uploading")
+    sent, failures = state.get("sent", 0), 0
+    deadline = time.monotonic() + 600
+    with path.open("rb") as video:
+        while True:
+            if failures >= 3 or time.monotonic() >= deadline:
+                raise RuntimeError("The YouTube upload paused after a connection problem. Retry to resume the same upload.")
+            if querying:
+                content, byte_range = b"", f"bytes */{size}"
+            else:
+                video.seek(sent)
+                content = video.read(1024 * 1024)
+                byte_range = f"bytes {sent}-{sent + len(content) - 1}/{size}"
+            try:
+                response = httpx.put(state["session"], content=content,
+                                     headers={**headers, "Content-Range": byte_range},
+                                     timeout=httpx.Timeout(30, connect=10))
+            except httpx.TransportError:
+                failures += 1
+                querying = True
+                progress(sent, "reconnecting")
+                continue
+            if response.status_code in (200, 201):
+                done = response.json()
+                if not done.get("id"):
+                    raise RuntimeError("YouTube did not confirm the upload. Check YouTube Studio before trying again.")
+                state["remote_id"] = done["id"]
+                progress(size, "complete")
+                break
+            if response.status_code == 308:
+                match = re.fullmatch(r"bytes[= ]0-(\d+)", response.headers.get("Range", ""))
+                acknowledged = int(match[1]) + 1 if match else 0
+                if acknowledged < 0 or acknowledged > size:
+                    raise RuntimeError("YouTube returned an invalid upload position. Check YouTube Studio.")
+                failures = 0 if acknowledged > sent else failures + 1
+                sent = acknowledged
+                querying = sent == size
+                progress(sent, "checking" if querying else "uploading")
+                continue
+            if response.status_code in (429, 500, 502, 503, 504):
+                failures += 1
+                querying = True
+                progress(sent, "reconnecting")
+                continue
+            if response.status_code in (404, 410):
+                raise RuntimeError("This YouTube upload expired. Check YouTube Studio before starting another upload.")
+            _check(response, "Uploading to YouTube")
+            raise RuntimeError("YouTube did not confirm the upload. Check YouTube Studio before trying again.")
     if publish_at is not None:
         try:
             actual = datetime.fromisoformat(done.get("status", {}).get("publishAt", "").replace("Z", "+00:00"))
@@ -387,6 +447,17 @@ def youtube_upload(acc, path: Path, title: str, description: str, tags: list, pr
         if not confirmed or done.get("status", {}).get("privacyStatus") != "private":
             raise YouTubeScheduleUnconfirmed(done["id"])
     return done["id"], f"https://www.youtube.com/shorts/{done['id']}"
+
+
+def youtube_status(acc, ids: list) -> dict:
+    out = {}
+    for i in range(0, len(ids), 50):
+        reply = _check(httpx.get("https://www.googleapis.com/youtube/v3/videos",
+                                 params={"part": "status,processingDetails", "id": ",".join(ids[i:i + 50])},
+                                 headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=15),
+                       "Checking YouTube processing").json()
+        out.update({video["id"]: video for video in reply.get("items", [])})
+    return out
 
 
 def youtube_views(acc, ids: list) -> dict:

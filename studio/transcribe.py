@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from . import config
+from . import config, work, ctx
 
 _lock = threading.Lock()
 
@@ -85,7 +85,12 @@ def _take():
             with _lock:
                 _made -= 1
             raise
-    return _free.get()
+    while True:
+        work.check()
+        try:
+            return _free.get(timeout=.1)
+        except queue.Empty:
+            continue
 
 
 def _take_now():
@@ -205,6 +210,7 @@ def transcribe(audio: np.ndarray, on_progress=None) -> list:
     words = []
     todo = []
     for a, b in _chunks(audio):
+        work.check()
         seg = audio[a:b].astype(np.float32) / 32768.0
         if len(seg) < 4800 or float(np.sqrt((seg ** 2).mean())) < 0.003:
             continue  # silence: skip, saves time and avoids made-up words
@@ -219,6 +225,7 @@ def transcribe(audio: np.ndarray, on_progress=None) -> list:
         segs = [seg for _, _, seg in group]
         got = None
         while got is None:
+            work.check()
             # whichever is free first: a place on the card's machine, or a copy of the model on this one
             if remote and _remote_ok() and REMOTE_SLOTS.acquire(blocking=False):
                 try:
@@ -244,6 +251,7 @@ def transcribe(audio: np.ndarray, on_progress=None) -> list:
                 continue
             time.sleep(0.02)
         out = [_words(tok, ts, a, b) for (a, b, _), (tok, ts) in zip(group, got)]
+        work.check()
         done[0] += 1
         if on_progress:
             on_progress(done[0] / len(groups))
@@ -255,7 +263,7 @@ def transcribe(audio: np.ndarray, on_progress=None) -> list:
     if workers > 1 and len(groups) > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(min(workers, len(groups)), thread_name_prefix="asr") as ex:
-            results = list(ex.map(decode, groups))
+            results = list(ex.map(ctx.bind(decode), groups))
     else:
         results = [decode(g) for g in groups]
     for out in results:

@@ -5,6 +5,9 @@ room, waits in line for a moment when it is nearly full, and is let through the 
 what keeps a rush from slowing everyone down or crashing the server."""
 import os
 import shutil
+import subprocess
+import sys
+import re
 import threading
 import time
 
@@ -22,6 +25,19 @@ _lock = threading.Lock()
 
 def _cpu_times():
     """(busy, total) processor time so far, in any unit."""
+    if sys.platform == "darwin":
+        import ctypes
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        ticks = (ctypes.c_uint * 4)()
+        count = ctypes.c_uint(4)
+        # HOST_CPU_LOAD_INFO: user, system, idle, nice, summed across processors.
+        host = lib.mach_host_self()
+        try:
+            if lib.host_statistics(host, 3, ticks, ctypes.byref(count)):
+                raise OSError("Could not read processor load")
+        finally:
+            lib.mach_port_deallocate(lib.mach_task_self(), host)
+        return ticks[0] + ticks[1] + ticks[3], sum(ticks)
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
@@ -36,6 +52,11 @@ def _cpu_times():
 
 
 def _ram_free_gb() -> float:
+    if sys.platform == "darwin":
+        reply = subprocess.check_output(["/usr/bin/vm_stat"], text=True, timeout=5)
+        page_size = int(re.search(r"page size of (\d+) bytes", reply)[1])
+        pages = sum(int(v) for v in re.findall(r"Pages (?:free|inactive|speculative):\s+(\d+)", reply))
+        return pages * page_size / 1e9
     if os.name == "nt":
         import ctypes
 

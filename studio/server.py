@@ -10,6 +10,8 @@ import re
 import shutil
 import threading
 import time
+import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -20,7 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from . import admin as admins
-from . import account, load
+from . import account, load, changes, transcript, work
 from . import (accounts, ai, alerts, auth, config, creators, ctx, db, jobs, live, media, posting,
                profiles, render, safe, transcribe, usage)
 
@@ -661,15 +663,29 @@ def _sync_unchanged(v: str):
 
 
 @app.get("/api/sync")
-def sync(v: str = ""):
+def sync(v: str = "", delta: int = 0):
     """What the page asks every couple of seconds. It sends the token it got last time; when nothing of this
     user's has changed, the answer is just that token: no files read, nothing built."""
     token = _sync_token()
     if v == token:
         return _sync_unchanged(v) or {"v": token}
     from . import notices
-    return {"v": token, "jobs": [jobs.public(j) for j in jobs.list_jobs()], "creators": _creator_rows(),
-            "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread()}
+    payload = {"v": token, "jobs": [jobs.public(j) for j in jobs.list_jobs()], "creators": _creator_rows(),
+               "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread()}
+    return changes.response(ctx.uid(), token, payload, v) if delta else payload
+
+
+@app.get("/api/performance")
+def performance():
+    rows = []
+    for job in jobs.list_jobs()[:20]:
+        seconds = (job.get("live") or {}).get("elapsed", job.get("duration", 0))
+        timings = dict(job.get("timings") or {})
+        heard = timings.get("transcription", 0)
+        rows.append({"id": job["id"], "title": job.get("title") or "Video", "status": job["status"],
+                     "timings": timings, "transcription_speed": round(seconds / heard, 1) if heard else None,
+                     "encoder": next((c.get("encoder") for c in reversed(job["clips"]) if c.get("encoder")), None)})
+    return {"encoder": render.encoder_status(), "load": load.state(), "jobs": rows}
 
 
 @app.get("/api/jobs")
@@ -947,6 +963,115 @@ def delete_job(jid: str):
         raise HTTPException(409, "This is still being worked on. Stop it or wait for it to finish first.")
     jobs.delete(jid)
     return {"ok": True}
+
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_work(jid: str, body: dict = Body(default={})):
+    job = _job_or_404(jid)
+    if job.get("kind") == "live" and not body.get("clip"):
+        raise HTTPException(409, "Use Stop recording to finish this live stream.")
+    try:
+        jobs.cancel(jid, body.get("clip"))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return jobs.public(job)
+
+
+def _editor_clip(jid, cid):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    return job, clip
+
+
+def _editor_source(job, clip):
+    source = clip.get("src") or job.get("source_path")
+    if not source or not Path(source).is_file():
+        raise HTTPException(409, "The source video is no longer available for editing.")
+    return Path(source), float(clip.get("src_offset", 0))
+
+
+def _editor_words(job, clip, start, end):
+    if "caption_words" in clip:
+        return [w for w in clip["caption_words"] if start <= w["s"] <= end]
+    if clip.get("fixed_words"):
+        return [w for w in clip["fixed_words"] if start <= w["s"] <= end]
+    if (Path(job["dir"]) / "live-words.sqlite3").exists():
+        return transcript.LiveStore(job["dir"]).between(start, end)
+    return [w for w in transcript.read(job["dir"]) if start <= w["s"] <= end]
+
+
+def _editor_waveform(job, clip, source, offset, start, end):
+    import numpy as np
+    cache = Path(job["dir"]) / f"wave-{clip['id']}.json"
+    signature = [str(source), source.stat().st_mtime_ns, start, end]
+    try:
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        if saved["signature"] == signature:
+            return saved["peaks"]
+    except (OSError, ValueError, KeyError):
+        pass
+    with work.task((job["id"], "wave-" + clip["id"]), timeout=30), tempfile.TemporaryDirectory(prefix="wave-") as tmp:
+        wav = Path(tmp) / "audio.wav"
+        media.extract_audio(source, wav, start=max(0, start - offset), end=end - offset)
+        audio = media.load_audio(wav).astype(np.float32) / 32768
+        peaks = [round(float(np.max(np.abs(part))), 4) if len(part) else 0 for part in np.array_split(audio, 240)]
+    temp = cache.with_suffix(".tmp")
+    temp.write_text(json.dumps({"signature": signature, "peaks": peaks}), encoding="utf-8")
+    temp.replace(cache)
+    return peaks
+
+
+@app.get("/api/jobs/{jid}/clips/{cid}/editor")
+def clip_editor(jid: str, cid: str):
+    job, clip = _editor_clip(jid, cid)
+    source, offset = _editor_source(job, clip)
+    start = max(offset, clip["start"] - 15)
+    end = min(float(clip.get("src_end", job["duration"])), clip["end"] + 15)
+    try:
+        peaks = _editor_waveform(job, clip, source, offset, start, end)
+    except work.Cancelled:
+        raise HTTPException(409, "A newer editor request replaced this one.")
+    return {"min": start, "max": end, "offset": offset, "peaks": peaks,
+            "words": _editor_words(job, clip, start, end), "version": clip.get("version", 0),
+            "source": f"/api/jobs/{jid}/clips/{cid}/source"}
+
+
+@app.get("/api/jobs/{jid}/clips/{cid}/source")
+def editor_source(jid: str, cid: str):
+    job, clip = _editor_clip(jid, cid)
+    source, offset = _editor_source(job, clip)
+    return FileResponse(source, headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/jobs/{jid}/clips/{cid}/preview")
+def preview_clip(jid: str, cid: str, body: dict = Body(default={})):
+    job, clip = _editor_clip(jid, cid)
+    _throttle("preview:" + ctx.uid(), 20, 600, "Give the preview a moment before trying again.")
+    source, offset = _editor_source(job, clip)
+    try:
+        edited = jobs.edited_clip(clip, body, job["duration"])
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    end = min(edited["end"], edited["start"] + 8)
+    words = edited.get("caption_words", _editor_words(job, clip, edited["start"] - 1, end + 1))
+    local = dict(edited, start=edited["start"] - offset, end=end - offset, _preview=True)
+    near = [dict(w, s=w["s"] - offset, e=w["e"] - offset) for w in words]
+    name = "preview-" + uuid.uuid4().hex
+    out_dir = Path(job["dir"]) / "clips"
+    try:
+        with work.task((jid, "preview-" + cid), timeout=60), tempfile.TemporaryDirectory(prefix="preview-", dir=job["dir"]) as tmp:
+            result = render.render_clip(source, Path(tmp), name, local, near, job["width"], job["height"])
+            work.check()
+            for path in Path(tmp).iterdir():
+                path.replace(out_dir / path.name)
+    except work.Cancelled:
+        raise HTTPException(409, "This preview was stopped or replaced by a newer preview.")
+    for path in out_dir.glob("preview-*"):
+        if path.stat().st_mtime < time.time() - 3600:
+            path.unlink(missing_ok=True)
+    return {"file": f"/media/{jid}/{result['file']}", "seconds": round(end - edited["start"], 2)}
 
 
 def _pairs(v, limit=300) -> list:

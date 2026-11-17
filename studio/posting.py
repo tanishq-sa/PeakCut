@@ -6,7 +6,7 @@ from pathlib import Path
 
 import json
 
-from . import accounts, alerts, config, creators, ctx, jobs, live
+from . import accounts, alerts, config, creators, ctx, joblog, jobs, live
 
 _lock = threading.RLock()
 _FILE = config.DATA_DIR / "posts.json"
@@ -20,13 +20,14 @@ def _mine() -> list:
     u = ctx.uid()
     return [p for p in _posts if p.get("user") == u]
 OPEN = ("scheduled", "posting")
-ON_YOUTUBE = ("youtube_scheduled", "needs_review")
+ON_YOUTUBE = ("youtube_scheduled", "youtube_processing", "needs_review")
 
 
 def _save():
     with _lock:
         tmp = _FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(_posts, indent=1), encoding="utf-8")
+        tmp.chmod(0o600)
         tmp.replace(_FILE)
 
 
@@ -39,7 +40,9 @@ def _mirror(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
-        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "publish_at", "error")}
+        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in (
+            "account_name", "platform", "status", "url", "due_at", "publish_at", "error",
+            "upload_bytes", "upload_total", "upload_stage", "upload_updated_at", "processing_percent")}
         jobs.save(job)
 
 
@@ -119,9 +122,27 @@ def _post(p):
         title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
         if acc["platform"] == "youtube":
             schedule = {}
-            if p.get("publish_at") is not None:
+            if p.get("publish_at") is not None and not p.get("upload_state", {}).get("session"):
                 schedule["publish_at"] = accounts.youtube_publish_time(p["publish_at"])
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"], **schedule)
+            elif p.get("publish_at") is not None:
+                schedule["publish_at"] = p["publish_at"]
+            state = p.setdefault("upload_state", {})
+            last = [None]
+            def progress(sent, total, stage):
+                with _lock:
+                    p.update(upload_bytes=sent, upload_total=total, upload_stage=stage, upload_updated_at=time.time())
+                    if state.get("remote_id"):
+                        p.update(remote_id=state["remote_id"], url=f"https://www.youtube.com/shorts/{state['remote_id']}")
+                    _save()
+                _mirror(p)
+                marker = (stage, int(sent / total * 10) if total else 0)
+                if marker != last[0]:
+                    last[0] = marker
+                    message = {"checking": "checking where the upload stopped", "reconnecting": "connection interrupted; reconnecting",
+                               "complete": "upload confirmed; waiting for YouTube processing"}.get(stage, f"uploading {int(sent / total * 100)}%")
+                    joblog.write(f"{clip['id']} · {acc['name']}: {message}", job=job)
+            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"],
+                                               upload_state=state, on_progress=progress, **schedule)
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
         elif acc["platform"] == "tiktok":
@@ -132,21 +153,30 @@ def _post(p):
             p.update(status="youtube_scheduled", uploaded_at=time.time(), remote_id=rid, url=url, error=None)
             creators.log(p["creator"], f"Scheduled on YouTube ({acc['name']}): {title}")
         else:
-            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
-            creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
+            if acc["platform"] == "youtube":
+                p.update(status="youtube_processing", uploaded_at=time.time(), remote_id=rid, url=url, error=None)
+                joblog.write(f"{clip['id']} · {acc['name']}: uploaded; YouTube is processing the video", job=job)
+            else:
+                p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
+                creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
+        p.pop("upload_state", None)
     except Exception as e:  # noqa: BLE001
         p["tries"] += 1
         p["error"] = str(e)[-300:]
         if isinstance(e, accounts.YouTubeScheduleUnconfirmed):
             p.update(status="needs_review", remote_id=e.remote_id, url=f"https://studio.youtube.com/video/{e.remote_id}/edit")
-        elif p.get("publish_at") is not None:
-            p.update(status="failed", error=p["error"] + " Check YouTube Studio before retrying; the upload may have reached YouTube.")
+        elif p.get("publish_at") is not None or (acc and acc["platform"] == "youtube"):
+            p.update(status="failed", error=p["error"] + (
+                " Retry will resume the same upload. Check YouTube Studio if needed." if p.get("upload_state", {}).get("session") else
+                " Check YouTube Studio before retrying; the upload may have reached YouTube."))
         elif p["tries"] < 3 and clip and acc:
             p.update(status="scheduled", due_at=time.time() + 600)  # try again in 10 minutes
         else:
             p["status"] = "failed"
             creators.log(p["creator"], f"Post failed on {p['account_name']}: {p['error']}")
             alerts.notify(f"post failed on {p['account_name']} ({p['title']}): {p['error'][:200]}", kind="post")
+        if job:
+            joblog.write(f"{p['clip']} · {p['account_name']}: {p['error']}", "error", job=job)
     _save()
     _mirror(p)
 
@@ -154,6 +184,14 @@ def _post(p):
 def _run():
     while True:
         time.sleep(15)
+        waiting = [p for p in list(_posts) if p["status"] in ("youtube_processing", "youtube_scheduled")
+                   and p.get("remote_id") and time.time() - p.get("checked_at", 0) >= 30]
+        for uid in {p.get("user") for p in waiting if p.get("user")}:
+            with ctx.as_user(uid):
+                try:
+                    _check_youtube([p for p in waiting if p.get("user") == uid])
+                except Exception:  # noqa: BLE001 - a network problem is tried again on the next check
+                    pass
         due = [p for p in list(_posts) if p["status"] == "scheduled" and p["due_at"] <= time.time() and p.get("user")]
         for p in due:
             try:
@@ -169,6 +207,55 @@ def _run():
                     _post(p)
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _check_youtube(posts):
+    """An accepted file is still being processed; only YouTube can say when it is ready."""
+    for aid in {p["account"] for p in posts}:
+        acc = accounts.get(aid)
+        if not acc:
+            continue
+        mine = [p for p in posts if p["account"] == aid]
+        try:
+            result = accounts.youtube_status(acc, [p["remote_id"] for p in mine])
+        except Exception as e:  # noqa: BLE001 - checking is read-only, so a lost connection is safe to retry
+            for p in mine:
+                error = f"Could not check YouTube processing: {joblog.clean(e)}. Will check again shortly."
+                job = jobs.get(p["job"])
+                if job and p.get("error") != error:
+                    joblog.write(f"{p['clip']} · {p['account_name']}: {error}", "warning", job=job)
+                p.update(error=error, checked_at=time.time())
+                _save()
+                _mirror(p)
+            continue
+        for p in mine:
+            before = p["status"]
+            video = result.get(p["remote_id"], {})
+            status, processing = video.get("status", {}), video.get("processingDetails", {})
+            p["checked_at"] = time.time()
+            if not video or status.get("uploadStatus") in ("failed", "rejected", "deleted") or processing.get("processingStatus") == "failed":
+                reason = status.get("failureReason") or status.get("rejectionReason") or processing.get("processingFailureReason") or "video not available"
+                p.update(status="needs_review", error=f"YouTube could not process this video: {reason}. Check YouTube Studio.",
+                         url=f"https://studio.youtube.com/video/{p['remote_id']}/edit")
+            elif status.get("uploadStatus") == "processed" or processing.get("processingStatus") == "succeeded":
+                p["error"] = None
+                if not p.get("publish_at") or status.get("privacyStatus") == "public":
+                    p.update(status="posted", posted_at=time.time(), error=None)
+                elif p["publish_at"] < time.time() - 300:
+                    p.update(status="needs_review", error="The publishing time passed, but YouTube still has the video as private. Check YouTube Studio.")
+            else:
+                p["error"] = None
+                progress = processing.get("processingProgress", {})
+                total = int(progress.get("partsTotal") or 0)
+                if total > 0:
+                    p["processing_percent"] = min(100, int(100 * int(progress.get("partsProcessed", 0)) / total))
+            if p["status"] != before:
+                job = jobs.get(p["job"])
+                if job:
+                    joblog.write(f"{p['clip']} · {p['account_name']}: " + ("YouTube finished processing" if p["status"] == "posted" else p["error"]),
+                                 "info" if p["status"] == "posted" else "error", job=job)
+            _save()
+            _mirror(p)
 
 
 def _stats_for(recent):
@@ -214,7 +301,7 @@ def retry(pid):
         p = next((p for p in _mine() if p["id"] == pid), None)
         if not p or p["status"] not in ("failed", "cancelled"):
             raise ValueError("Only failed or cancelled posts can be retried.")
-        if p.get("publish_at") is not None:
+        if p.get("publish_at") is not None and not p.get("upload_state", {}).get("session"):
             accounts.youtube_publish_time(p["publish_at"], lead=300)
         p.update(status="scheduled", due_at=time.time(), tries=0, error=None)
         _save()
@@ -243,7 +330,7 @@ def overview() -> dict:
     names = {c["id"]: c["name"] for c in all_cs}
     queue = sorted((p for p in _posts if p["status"] in OPEN + ON_YOUTUBE), key=lambda p: p.get("publish_at") or p["due_at"])
     done = sorted((p for p in _posts if p["status"] in ("posted", "failed")), key=lambda p: -(p.get("posted_at") or p["due_at"]))[:15]
-    show = [{**{k: v for k, v in p.items() if k != "user"}, "creator_name": names.get(p["creator"], "")} for p in queue + done]
+    show = [{**{k: v for k, v in p.items() if k not in ("user", "upload_state")}, "creator_name": names.get(p["creator"], "")} for p in queue + done]
     # last 14 days, oldest first, for the home graph
     days = [_day(time.time() - 86400 * i) for i in range(13, -1, -1)]
     made, posted, views = {d: 0 for d in days}, {d: 0 for d in days}, {d: 0 for d in days}
@@ -278,7 +365,11 @@ def start():
     with _lock:
         for p in _posts:
             if p["status"] == "posting":  # interrupted mid-upload last time
-                p.update(status="failed", error="The studio closed during this upload. Check the account, then retry.")
+                p.update(status="failed", error="The studio closed during this upload. Check YouTube Studio, then retry." +
+                         (" Retry will resume the same upload." if p.get("upload_state", {}).get("session") else ""))
+            if p.get("user"):
+                with ctx.as_user(p["user"]):
+                    _mirror(p)
         _save()
     jobs.on_clip_ready.append(on_clip_ready)
     threading.Thread(target=_run, daemon=True).start()

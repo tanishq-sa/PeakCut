@@ -2,7 +2,10 @@
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+from functools import lru_cache
 from pathlib import Path
 
 from . import config, roman, tools
@@ -237,8 +240,50 @@ def _filter(layout, fg_h):
             f"[bg][fg]overlay=0:(H-h)/2,setsar=1[v0];")
 
 
-_qsv_ok = None
+_failed_encoders = set()
+_encoder_lock = threading.Lock()
+_render_slots = threading.BoundedSemaphore(config.RENDER_WORKERS)
+_active_renders = 0
+_last_encoder = None
+
+
+@lru_cache(maxsize=1)
+def _available_encoders():
+    try:
+        reply = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True,
+                               text=True, timeout=10, creationflags=NO_WINDOW)
+        return {line.split()[1] for line in reply.stdout.splitlines()
+                if len(line.split()) > 1 and line.strip().startswith("V")}
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+
+
+def _encoders():
+    available = _available_encoders()
+    if sys.platform == "darwin":
+        supported = {"h264_videotoolbox"}
+    elif sys.platform in ("win32", "linux"):
+        supported = {"h264_nvenc", "h264_qsv"}
+    else:
+        supported = set()
+    choices = [
+        ("h264_videotoolbox", ["nv12", "-c:v", "h264_videotoolbox", "-b:v", "8M", "-allow_sw", "0"]),
+        ("h264_nvenc", ["yuv420p", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-b:v", "0"]),
+        ("h264_qsv", ["nv12", "-c:v", "h264_qsv", "-global_quality", "23", "-preset", "fast"]),
+    ]
+    with _encoder_lock:
+        out = [(name, args) for name, args in choices
+               if name in supported and name in available and name not in _failed_encoders]
+    return out + [("libx264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"])]
 RENDER_SECONDS = 600      # one clip's video encode; far beyond normal, so a frozen encoder is stopped, not waited on
+
+
+def encoder_status():
+    preferred = _encoders()[0][0]
+    with _encoder_lock:
+        return {"system": sys.platform, "preferred": preferred, "last": _last_encoder,
+                "active": _active_renders, "limit": config.RENDER_WORKERS,
+                "hardware_unavailable": bool(_failed_encoders)}
 
 
 def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, src_w: int, src_h: int) -> dict:
@@ -255,36 +300,54 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     # break the filter syntax).
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
-        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass)
+        from . import work as tasks
+        while not _render_slots.acquire(timeout=.1):
+            tasks.check()
+        try:
+            tasks.check()
+            if clip.get("_preview"):
+                return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, preview=True)
+            return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass)
+        finally:
+            _render_slots.release()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str) -> dict:
-    global _qsv_ok
+def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, preview=False) -> dict:
+    global _active_renders, _last_encoder
+    from . import work as tasks
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
     fc = _filter(layout, fg_h) + f"[v0]ass={name}.ass:fontsdir=f[v]"
-    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", str(src),
+    if preview:
+        fc = fc.replace("[v]", "[captioned];[captioned]scale=360:640[v]")
+    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}",
+            "-threads", str(config.RENDER_THREADS), "-i", str(src),
+            "-threads", str(config.RENDER_THREADS), "-filter_complex_threads", str(config.RENDER_THREADS),
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]
-    encoders = []
-    if _qsv_ok is not False:
-        encoders.append(("qsv", ["nv12", "-c:v", "h264_qsv", "-global_quality", "23", "-preset", "fast"]))
-    encoders.append(("x264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"]))
     err = None
-    for label, enc in encoders:
-        p = subprocess.run(base + enc + [f"{name}.mp4"], cwd=work, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
+    for label, enc in _encoders():
+        tasks.check()
+        with _encoder_lock:
+            _active_renders += 1
+        try:
+            p = tasks.run(base + enc + [f"{name}.mp4"], runner=subprocess.run, cwd=work, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
+        finally:
+            with _encoder_lock:
+                _active_renders -= 1
         if p.returncode == 0:
-            if label == "qsv":
-                _qsv_ok = True
+            with _encoder_lock:
+                _last_encoder = label
             break
         err = p.stderr[-1200:]
-        if label == "qsv":
-            _qsv_ok = False
+        if label != "libx264":
+            with _encoder_lock:
+                _failed_encoders.add(label)
     else:
         raise RuntimeError(f"Render failed: {err}")
     cover_t = min(1.2, (end - start) / 2)
@@ -292,4 +355,4 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
          "-q:v", "3", f"{name}.jpg"], cwd=work)
     for ext in ("mp4", "jpg", "ass"):
         shutil.move(str(work / f"{name}.{ext}"), str(out_dir / f"{name}.{ext}"))
-    return {"file": f"{name}.mp4", "cover": f"{name}.jpg", "layout": layout}
+    return {"file": f"{name}.mp4", "cover": f"{name}.jpg", "layout": layout, "encoder": label}

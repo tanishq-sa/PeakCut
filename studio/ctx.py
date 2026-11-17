@@ -42,14 +42,10 @@ def as_user(u):
 
 def bind(fn):
     """Wrap fn so it runs as the current user, even on another thread (threads do not inherit this)."""
-    u = _uid.get()
+    context = contextvars.copy_context()
 
     def run(*a, **k):
-        token = _uid.set(u)
-        try:
-            return fn(*a, **k)
-        finally:
-            _uid.reset(token)
+        return context.copy().run(fn, *a, **k)
 
     return run
 

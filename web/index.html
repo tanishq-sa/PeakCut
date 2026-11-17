@@ -498,6 +498,11 @@ img.av{object-fit:cover}
 /* ---------- jobs + clips */
 .job{margin-bottom:36px}
 .job-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;margin-bottom:14px}
+.job-logs{margin:14px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.job-logs summary{padding:10px 12px;cursor:pointer;color:var(--dim);font-size:12px}
+.job-logs summary:hover{color:var(--text)}
+.job-logs summary:focus-visible{outline:2px solid var(--brand-ink);outline-offset:-3px}
+.job-logs pre{margin:0;padding:12px;max-height:260px;overflow:auto;border-top:1px solid var(--line);background:var(--bg);color:var(--text);font:11px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .jt{display:flex;gap:14px;align-items:center;min-width:0}
 .jthumb{position:relative;flex:none;width:128px;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:var(--muted);display:grid;place-items:center;color:var(--faint)}
 .jthumb img{width:100%;height:100%;object-fit:cover;display:block}
@@ -599,6 +604,19 @@ dialog::backdrop{background:rgba(14,12,11,.42);animation:fadein .16s ease}
 .editor video,.editor .stage img{width:100%;max-height:calc(100vh - 48px);aspect-ratio:9/16;object-fit:contain;display:block}
 .editor .panel{padding:22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
 .editor h3{font-size:13px;font-weight:600;color:var(--dim);margin-top:6px}
+.wave{position:relative;height:80px;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--muted);overflow:hidden}
+.wave svg{width:100%;height:100%;display:block;fill:var(--brand)}
+.wave-selection{position:absolute;top:0;bottom:0;border-inline:2px solid var(--brand-deep);background:rgba(255,139,51,.12);pointer-events:none}
+.trim-handle{position:absolute;inset:0;width:100%;height:100%;margin:0;appearance:none;background:transparent;pointer-events:none}
+.trim-handle::-webkit-slider-thumb{appearance:none;width:12px;height:80px;background:var(--brand-deep);border:2px solid white;border-radius:4px;cursor:ew-resize;pointer-events:auto}
+.trim-handle::-moz-range-thumb{width:10px;height:76px;background:var(--brand-deep);border:2px solid white;border-radius:4px;cursor:ew-resize;pointer-events:auto}
+.trim-handle:focus-visible{outline:2px solid var(--brand-deep);outline-offset:-2px}
+.caption-words{max-height:230px;overflow:auto;border:1px solid var(--line);padding:8px;border-radius:var(--r-sm)}
+.caption-word{display:grid;grid-template-columns:minmax(100px,1fr) 74px 74px;gap:5px;margin-bottom:5px}
+.caption-word input{width:100%;min-width:0;padding:6px;border:1px solid var(--line-2);border-radius:4px;font:inherit;background:var(--bg);color:var(--text)}
+.perf-scroll{overflow:auto}.perf-table{border-collapse:collapse;width:100%;font-size:13px}
+.perf-table th,.perf-table td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line)}
+.perf-table th{font-weight:500;color:var(--dim)}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 #toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:50}
 .toast{background:var(--frame);color:var(--frame-text);border:1px solid var(--frame-2);border-radius:var(--r);padding:12px 16px;max-width:380px;animation:rise .2s ease;display:flex;gap:10px;align-items:center;font-weight:500}
@@ -835,6 +853,7 @@ dialog[open]{animation:fadein .16s ease}
 <div class="pop menu" id="acctpop" role="menu" hidden></div>
 
 <script src="/assets/gradient-ascii.js"></script>
+<script src="/assets/studio-tools.js?v=1"></script>
 <script>
 /* ============================================================ helpers */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1665,8 +1684,18 @@ async function makeClips() {
 function scoreCls(s) { return s >= 80 ? "s-hi" : s >= 60 ? "s-mid" : ""; }
 function postLabel(p) {
   if (p.status === "youtube_scheduled") return `Scheduled on YouTube · ${new Date(p.publish_at * 1000).toLocaleString()}`;
+  if (p.status === "youtube_processing") return `Uploaded · YouTube processing${p.processing_percent != null ? ` · ${p.processing_percent}%` : ""}`;
   if (p.status === "needs_review") return "Check YouTube Studio";
-  if (p.status === "posting") return p.publish_at ? "Uploading to YouTube — keep PeakCut open" : "Posting now";
+  if (p.status === "posting") {
+    if (p.platform === "youtube") {
+      const percent = p.upload_total ? ` · ${Math.min(100, Math.floor(100 * (p.upload_bytes || 0) / p.upload_total))}%` : "";
+      if (p.upload_stage === "reconnecting") return "Reconnecting to YouTube" + percent;
+      if (p.upload_stage === "checking") return "Checking upload with YouTube" + percent;
+      if (p.upload_stage === "complete") return "Upload confirmed · checking YouTube status";
+      return p.upload_total ? "Uploading to YouTube" + percent : "Connecting to YouTube";
+    }
+    return "Posting now";
+  }
   if (p.status === "scheduled") return p.publish_at ? "Waiting to upload — keep PeakCut open" : clock(p.due_at);
   return p.status === "posted" ? "Posted" : p.status === "failed" ? "Failed" : p.status;
 }
@@ -1674,7 +1703,7 @@ function postPills(c) {
   return Object.values(c.posts || {}).filter(p => p.status !== "cancelled").map(p => {
     const cls = ["posted", "youtube_scheduled"].includes(p.status) ? "ok" : ["failed", "needs_review"].includes(p.status) ? "bad" : "warn";
     const txt = `${esc(p.account_name)} · ${esc(postLabel(p))}`;
-    return p.url ? `<a class="pill ${cls}" href="${esc(p.url)}" target="_blank" rel="noopener">${txt}</a>` : `<span class="pill ${cls}" title="${esc(p.error || "")}">${txt}</span>`;
+    return p.url ? `<a class="pill ${cls}" href="${esc(p.url)}" title="${esc(p.error || "")}" target="_blank" rel="noopener">${txt}</a>` : `<span class="pill ${cls}" title="${esc(p.error || "")}">${txt}</span>`;
   }).join("");
 }
 function clipHtml(j, c) {
@@ -1729,6 +1758,15 @@ function liveHtml(j) {
     </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
     ${j.clips.length ? `<div class="grid" style="margin-bottom:28px">${[...j.clips].reverse().map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
+function jobLogsHtml(j) {
+  const rows = j.logs || [];
+  const lines = rows.map(row => {
+    const time = row.time ? new Date(row.time * 1000).toLocaleTimeString() : "Earlier";
+    const level = row.level === "error" ? "ERROR · " : row.level === "warning" ? "WARNING · " : "";
+    return esc(`${time}  ${level}${row.message}`);
+  }).join("\n");
+  return `<details class="job-logs" ${["running", "queued", "error"].includes(j.status) ? "open" : ""}><summary>Processing log${rows.length ? ` · ${rows.length} ${rows.length === 1 ? "entry" : "entries"}` : ""}</summary><pre tabindex="0" aria-label="Processing log">${lines || "Waiting for processing to start…"}</pre></details>`;
+}
 function jobHtml(j) {
   if (j.status === "live") return liveHtml(j);
   const busy = j.status === "queued" || j.status === "running";
@@ -1737,13 +1775,14 @@ function jobHtml(j) {
                 j.took ? "made in " + fmt(j.took) : "", j.kind === "live" ? "recording, " + j.stage.toLowerCase() : ""].filter(Boolean).map(esc).join(" · ");
   const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
-      <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
+      <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? `<button class="btn sm danger" data-act="canceljob" data-j="${j.id}">${ic("stop")}Stop processing</button>` : `
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
         <button class="btn sm icon ghost" data-act="deljob" data-j="${j.id}" title="Delete" aria-label="Delete this video and its clips">${ic("trash")}</button>
         <label class="selck" title="Select this video and its clips"><input type="checkbox" data-sel="j:${j.id}" ${sel().has("j:" + j.id) ? "checked" : ""} aria-label="Select this video"></label>`}</div></div>
     ${busy ? `<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><p class="sub">${esc(j.stage)} · ${Math.round(j.progress * 100)}%</p>` : ""}
-    ${j.status === "done" && !j.clips.length ? `<p class="sub">${esc(j.stage)}</p>` : ""}
+    ${(j.status === "done" && (!j.clips.length || j.clips.some(c => c.status === "error"))) || j.status === "cancelled" ? `<p class="sub">${esc(j.stage)}</p>` : ""}
     ${j.error ? `<div class="err">${esc(j.error)}<button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
+    ${jobLogsHtml(j)}
     ${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 /* ---- selecting several videos and clips: delete or download them together */
@@ -1792,7 +1831,7 @@ function askTyped(title, text, mustType, okLabel) {
     d.onclose = () => res(d.returnValue === "yes" ? i.value.trim() : null); d.returnValue = "no"; d.showModal(); i.focus();
   });
 }
-function drawJobs() {
+function drawJobs(changed) {
   const root = $("#jobs"); if (!root) return;
   const cid = creatorId();
   let list = cid ? S.jobs.filter(j => j.creator === cid) : S.jobs;
@@ -1812,7 +1851,15 @@ function drawJobs() {
     let el = $(`section[data-job="${j.id}"]`, root);
     if (!el) { el = document.createElement("section"); el.className = "job"; el.dataset.job = j.id; }
     if (root.children[i] !== el) root.insertBefore(el, root.children[i] || null);
-    put(el, jobHtml(j));
+    if (!changed || changed.has(j.id) || !el.hasChildNodes()) {
+      const oldLog = $(".job-logs", el), oldText = oldLog?.querySelector("pre");
+      const open = oldLog?.open, scroll = oldText?.scrollTop || 0;
+      const atEnd = !oldText || oldText.scrollHeight - oldText.clientHeight - scroll < 24;
+      put(el, jobHtml(j));
+      const log = $(".job-logs", el), text = log?.querySelector("pre");
+      if (log && open != null) log.open = open;
+      if (text) text.scrollTop = atEnd ? text.scrollHeight : scroll;
+    }
   });
 }
 
@@ -1999,6 +2046,7 @@ function drawUsage() {
 /* ============================================================ settings */
 // With sign-in off there is no profile or password to manage. The AI section is for whoever runs the server.
 const setTabs = () => [
+  ["performance", "Performance", "bolt", "Encoder, processing speed and waiting time"],
   ...(S.status.user?.is_admin ? [["ai", "AI", "bolt", "Your AI service, model and key"]] : []),
   ...(S.status.accounts === false ? [] : [["profile", "Profile", "user", "Your name, email and how you sign in"],
                                           ["security", "Security", "lock", "Password and signing out"]]),
@@ -2021,7 +2069,11 @@ async function drawSettings() {
     <div class="set-body" id="setbody"><div class="set-load">Loading…</div></div></div>`;
   const body = $("#setbody");
   try {
-    if (tab === "ai") {
+    if (tab === "performance") {
+      const data = await api("/api/performance");
+      if (S.stab && S.stab !== "performance") return;
+      body.innerHTML = performanceHtml(data);
+    } else if (tab === "ai") {
       const k = S.ai = await api("/api/ai");
       body.innerHTML = `<section class="set-sec"><h2>AI</h2><p class="help">PeakCut uses an AI model to pick the moments worth clipping and to write hooks, titles and captions. Use your own key from any of these services. You pay that service directly. Without a key, clips are picked by loudness.</p>
           <div class="ai-state">${k.ready ? `<span class="pill ok">${ic("check")}Ready</span><span class="sub">${esc(k.label)} · ${esc(k.models[0] || "")}</span>` : `<span class="pill warn">Not set up</span><span class="sub">Choose a service, paste your key and pick a model.</span>`}</div>
@@ -2127,7 +2179,64 @@ async function drawSettings() {
 async function saveSettings() { const d = {}; $$("#sform [data-s]").forEach(i => d[i.dataset.s] = i.value); await send("/api/settings", d, "PUT"); }
 
 /* ============================================================ clip editor */
-function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; drawClipDlg(true); $("#clipdlg").showModal(); }
+function performanceHtml(data) {
+  const names = {h264_videotoolbox:"Apple VideoToolbox", h264_nvenc:"NVIDIA NVENC", h264_qsv:"Intel Quick Sync", libx264:"Software (x264)"};
+  const e = data.encoder, sec = value => Number(value || 0).toFixed(1) + "s";
+  return `<section class="set-sec"><h2>Performance</h2><p class="help">See where time goes while PeakCut makes your clips.</p>
+    <div class="stats"><div class="stat"><b>${esc(names[e.last || e.preferred] || e.preferred)}</b><span>${e.last ? "Last encoder used" : "Preferred encoder"}</span></div>
+      <div class="stat"><b>${e.active} / ${e.limit}</b><span>Encoders busy</span></div><div class="stat"><b>${data.load.cpu}%</b><span>Processor use</span></div>
+      <div class="stat"><b>${data.load.ram_free_gb} GB</b><span>Memory available</span></div></div>
+    ${e.hardware_unavailable ? `<p class="help">A hardware encoder was unavailable. PeakCut uses software when needed.</p>` : ""}
+    <div class="perf-scroll"><table class="perf-table"><thead><tr><th>Video</th><th>Audio / video download</th><th>Transcription</th><th>AI</th><th>Queue</th><th>Render</th></tr></thead><tbody>
+      ${data.jobs.map(j => `<tr><td>${esc(j.title)}${j.transcription_speed ? `<br><small>${j.transcription_speed}× audio processing speed</small>` : ""}</td>
+        <td>${sec(j.timings.audio_download)} / ${sec(j.timings.video_download)}</td><td>${sec(j.timings.transcription)}</td><td>${sec(j.timings.ai)}</td><td>${sec(j.timings.render_queue)}</td><td>${sec(j.timings.render)}</td></tr>`).join("") || `<tr><td colspan="6">Timings appear as you process a video.</td></tr>`}
+    </tbody></table></div><p class="help">Times add across parallel tasks and can exceed total elapsed time. Rendering includes waiting for an encoder slot.</p>
+    <button class="btn" data-act="perfrefresh">Refresh</button></section>`;
+}
+async function refreshPerformance() {
+  const data = await api("/api/performance");
+  if (S.view === "settings" && S.stab === "performance") put($("#setbody"), performanceHtml(data));
+}
+function openClip(jid, cid) {
+  D.jid = jid; D.cid = cid; D.sig = ""; D.editor = null; D.request = (D.request || 0) + 1;
+  drawClipDlg(true); $("#clipdlg").showModal(); loadClipEditor(jid, cid, D.request);
+}
+async function loadClipEditor(jid, cid, request) {
+  try {
+    const data = await api(`/api/jobs/${jid}/clips/${cid}/editor`);
+    if (D.request !== request || D.jid !== jid || D.cid !== cid) return;
+    D.editor = data;
+    const start = $("#clipdlg [data-f=start]"), end = $("#clipdlg [data-f=end]");
+    for (const input of [start, end]) { input.min = data.min; input.max = data.max; }
+    $("#timeline").innerHTML = `<div class="wave"><svg viewBox="0 0 ${data.peaks.length} 80" preserveAspectRatio="none" role="img" aria-label="Audio waveform">${data.peaks.map((p,i) => `<rect x="${i}" y="${40 - Math.max(1,p*38)}" width=".7" height="${Math.max(2,p*76)}"/>`).join("")}</svg><div class="wave-selection"></div>
+      <input class="trim-handle" data-trim="start" type="range" min="${data.min}" max="${data.max}" step=".05" value="${start.value}" aria-label="Trim start">
+      <input class="trim-handle" data-trim="end" type="range" min="${data.min}" max="${data.max}" step=".05" value="${end.value}" aria-label="Trim end"></div>
+      <p class="help">Drag either handle or use the arrow keys. Times refer to the original video.</p>
+      <div class="row"><button class="btn sm" data-act="editsource">Play selected source</button><button class="btn sm" data-act="previewclip">Preview edited captions (up to 8s)</button></div>
+      <p class="help" id="preview-note">Source playback shows timing; the preview includes your caption and layout changes.</p>
+      <h3>Caption words</h3><p class="help">Correct each word or its start and end times. Clear a word to remove it.</p>
+      <div class="caption-words">${data.words.map((w,i) => `<div class="caption-word" data-word="${i}"><input data-part="w" aria-label="Caption word ${i+1}" value="${esc(w.w)}" maxlength="80"><input data-part="s" type="number" step=".01" aria-label="Word ${i+1} start" value="${w.s}"><input data-part="e" type="number" step=".01" aria-label="Word ${i+1} end" value="${w.e}"></div>`).join("") || `<p class="help">No spoken words in this part.</p>`}</div>`;
+    $$("#timeline [data-trim]").forEach(input => input.addEventListener("input", () => updateTrim(input.dataset.trim, Number(input.value))));
+    [start, end].forEach(input => input.addEventListener("input", () => updateTrim(input.dataset.f, Number(input.value))));
+    updateTrim('end', Number(end.value));
+  } catch (error) {
+    if (D.request === request && $("#timeline")) $("#timeline").textContent = error.message;
+  }
+}
+function updateTrim(handle, value) {
+  const a = $("#clipdlg [data-f=start]"), b = $("#clipdlg [data-f=end]"), ed = D.editor;
+  if (!ed) return;
+  const span = PeakCutTools.trim(handle === 'start' ? value : Number(a.value), handle === 'end' ? value : Number(b.value), ed.min, ed.max, handle);
+  a.value = span.start; b.value = span.end;
+  for (const input of $$("#timeline [data-trim]")) input.value = span[input.dataset.trim];
+  const selection = $("#timeline .wave-selection");
+  selection.style.left = (span.start-ed.min)/(ed.max-ed.min)*100 + '%'; selection.style.width = (span.end-span.start)/(ed.max-ed.min)*100 + '%';
+}
+function editorBody() {
+  const body = {}; $$("#clipdlg [data-f]").forEach(i => body[i.dataset.f] = i.type === "number" ? Number(i.value) : i.value);
+  if (D.editor) body.words = PeakCutTools.captionWords($$("#timeline [data-word]").map(row => Object.fromEntries($$("[data-part]", row).map(i => [i.dataset.part, i.value]))));
+  return body;
+}
 function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
   if (!c) { if (dlg.open) dlg.close(); return; }
@@ -2146,10 +2255,12 @@ function drawClipDlg(full) {
           <label class="f">Layout<select data-f="layout">${opts(S.status.layouts, c.layout)}</select></label></div>
         <div class="two"><label class="f">Start (seconds)<input data-f="start" type="number" step="0.5" value="${c.start}"></label>
           <label class="f">End (seconds)<input data-f="end" type="number" step="0.5" value="${c.end}"></label></div>
+        <div id="timeline"><p class="help">Loading waveform and words…</p></div>
         <h3>Post text</h3>
         <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
         <button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>
+        <button class="btn danger" data-act="cancelclip">Stop making this clip</button>
         <h3>Post it</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
         ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
@@ -2168,26 +2279,34 @@ function drawClipDlg(full) {
   D.sig = sig;
   put($("#dposts"), postPills(c));
 }
-$("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.jid = null; });
+$("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.jid = null; D.editor = null; D.request = (D.request || 0) + 1; });
 $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 
 /* ============================================================ render + polling */
-function render() {
-  drawShell(); drawJobs(); drawStream(); drawSelBar();
+function render(changed) {
+  drawShell(); drawJobs(changed); drawStream(); drawSelBar();
   if (S.view === "overview") drawOverview();
   if ($("#clog")) drawLog();
   if (D.jid) drawClipDlg(false);
 }
+let syncPending = null;
 async function tick() {
+  if (syncPending) return syncPending;
+  syncPending = syncTick();
+  try { return await syncPending; } finally { syncPending = null; }
+}
+async function syncTick() {
   try {
-    const got = await api("/api/sync?v=" + encodeURIComponent(S.syncV || ""));
+    const got = await api("/api/sync?delta=1&v=" + encodeURIComponent(S.syncV || ""));
     const fresh = !!got.jobs, stale = Date.now() - (S.ovAt || 0) > 20000;
     S.syncV = got.v;
     if (!fresh) {                                   // nothing of ours changed on the server
       if (S.view === "overview" && stale) { S.overview = await api("/api/overview"); S.ovAt = Date.now(); render(); }
       return;
     }
-    const {jobs, creators, accounts} = got;
+    const jobs = got.delta ? PeakCutTools.mergeRows(S.jobs, got.jobs, got.removed_jobs).sort((a,b) => b.created - a.created) : got.jobs;
+    const creators = got.delta ? PeakCutTools.mergeRows(S.creators, got.creators, got.removed_creators) : got.creators;
+    const accounts = got.accounts || S.accounts;
     // a server from before multi-channel support sends only `channel`: show it as that platform's channel
     creators.forEach(c => { if (!c.channels) { const u = c.channel || "", k = /youtu/i.test(u) ? "youtube" : /twitch/i.test(u) ? "twitch" : /kick/i.test(u) ? "kick" : ""; c.channels = k ? {[k]: u} : {}; } });
     S.jobs = jobs; S.creators = creators; S.accounts = accounts;
@@ -2195,7 +2314,7 @@ async function tick() {
     if (got.unread != null) S.status.unread = got.unread;
     if (S.view === "overview") { S.overview = await api("/api/overview"); S.ovAt = Date.now(); }
     if (creatorId() && !creator()) return go("overview");
-    render();
+    render(got.delta && !got.creators.length && !got.removed_creators.length ? new Set(got.jobs.map(j => j.id)) : null);
   } catch {}
 }
 // Back on the tab (or window): ask straight away instead of waiting out the slow background timer, and put a
@@ -2454,8 +2573,32 @@ document.addEventListener("click", async e => {
       await api(`/api/accounts/${d.id}`, {method:"DELETE"}); await tick(); return drawSettings();
     }
     if (a === "remake") {
-      const body = {}; $$("#clipdlg [data-f]").forEach(i => body[i.dataset.f] = i.type === "number" ? Number(i.value) : i.value);
+      const body = editorBody();
       await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
+    }
+    if (a === "canceljob" || a === "cancelclip") {
+      const jid = a === "canceljob" ? d.j : D.jid;
+      await send(`/api/jobs/${jid}/cancel`, a === "cancelclip" ? {clip:D.cid} : {});
+      toast("Work stopped", "ok"); return tick();
+    }
+    if (a === "perfrefresh") return refreshPerformance();
+    if (a === "editsource") {
+      const ed = D.editor; if (!ed) return;
+      const start = Number($("#clipdlg [data-f=start]").value), end = Number($("#clipdlg [data-f=end]").value);
+      $("#stage").innerHTML = `<video controls autoplay playsinline src="${esc(ed.source)}#t=${start-ed.offset},${end-ed.offset}"></video>`;
+      const video = $("#stage video"); video.ontimeupdate = () => { if (video.currentTime >= end - ed.offset) video.pause(); };
+      return;
+    }
+    if (a === "previewclip") {
+      const jid = D.jid, cid = D.cid, request = D.request, body = editorBody();
+      const note = $("#preview-note"); note.textContent = "Making a small preview…"; b.disabled = true;
+      try {
+        const preview = await send(`/api/jobs/${jid}/clips/${cid}/preview`, body);
+        if (D.request !== request || D.jid !== jid || D.cid !== cid) return;
+        $("#stage").innerHTML = `<video controls autoplay playsinline src="${esc(preview.file)}"></video>`;
+        note.textContent = `Preview of the first ${preview.seconds} seconds. Save and re-make when you are ready.`;
+      } finally { b.disabled = false; }
+      return;
     }
     if (a === "postnow" || a === "postqueue" || a === "postschedule") {
       const accs = $$("#clipdlg [data-pacc]:checked").map(i => i.value);
