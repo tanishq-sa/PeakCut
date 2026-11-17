@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from . import brain, config, creators, ctx, joblog, load, media, render, roman, safe, timing, transcribe, transcript, usage, work
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 _live_pool = ThreadPoolExecutor(max_workers=max(1, config.RENDER_WORKERS), thread_name_prefix="live-render")
 _live_lanes = {}
@@ -455,6 +455,28 @@ def render_one(job, clip, words):
                 save(job)
 
 
+def _has_caption_words(clip):
+    span = [round(clip["start"], 2), round(clip["end"], 2), "en2"]
+    return "caption_words" in clip or (clip.get("fixed_for") == span and clip.get("fixed_words") and not any(
+        roman.needs_roman(word.get("w", "")) for word in clip["fixed_words"]))
+
+
+def _prepare_captions(job, clips, groups):
+    pending = [(clip, words) for clip, words in zip(clips, groups)
+               if clip.get("status") != "error" and not _has_caption_words(clip)]
+    if not pending:
+        return
+    _set(job, stage=f"Polishing captions for {len(pending)} clip{'s' if len(pending) != 1 else ''}")
+    raw = [[word for word in words if clip["start"] - 1 <= word["s"] <= clip["end"] + 1] for clip, words in pending]
+    fixed = brain.english_caption_batch(raw, job.get("lang") or "", job.get("title") or "",
+                                        youtube_english=lambda i: _english_part(job, pending[i][0]))
+    with _lock:
+        work.check()
+        for (clip, _), words in zip(pending, fixed):
+            clip.update(fixed_words=words, fixed_for=[round(clip["start"], 2), round(clip["end"], 2), "en2"])
+    save(job)
+
+
 def _render_one(job, clip, words):
     d = Path(job["dir"])
     clip["status"] = "rendering"
@@ -480,6 +502,10 @@ def _render_one(job, clip, words):
                 raw = brain.english_captions(raw, job.get("lang") or "", job.get("title") or "",
                                              youtube_english=lambda: _english_part(job, clip))
                 clip.update(fixed_words=raw, fixed_for=span)
+                with _lock:
+                    work.check()
+                    target.update(fixed_words=raw, fixed_for=span)
+                save(job)  # keep polished captions even if the video encode fails
             except Exception as e:  # noqa: BLE001 - captions still render with the words as heard
                 work.check()
                 joblog.write(f"{clip['id']}: caption cleanup failed; using the original words. {e}", "warning", job=job)
@@ -732,21 +758,60 @@ def _run_pipeline(job):
     def make_current(clip, words_now, queued_at):
         timing.add(job, "render_queue", time.monotonic() - queued_at)
         began[clip["id"]] = time.time()
-        if src["type"] == "url" and (pieces or not whole_video()):
-            timing.call(job, "video_download", _fetch_piece, job, clip, audio, audio_start=audio_start)
-        if clip["status"] != "error" and yt and yt[1].lower().startswith("en"):
-            # The clip was found with YouTube's transcript. What is shown on screen comes from our own model,
-            # run on just this clip: full punctuation, nothing blanked out, timings to the word.
-            a0, b0 = max(lo, int((clip["start"] - audio_start - 1.5) * 16000)), min(hi, int((clip["end"] - audio_start + 1.5) * 16000))
-            try:
-                tw = [dict(w, s=round(w["s"] + audio_start + a0 / 16000, 2), e=round(w["e"] + audio_start + a0 / 16000, 2)) for w in timing.call(job, "transcription", transcribe.transcribe, audio[a0:b0])]
-            except Exception:  # noqa: BLE001 - the clip is still made, with YouTube's words
-                tw = []
-            if len(tw) >= 3:
-                exact[clip["id"]] = (audio_start + a0 / 16000, audio_start + b0 / 16000, tw)
-                words_now = tw
         if clip["status"] != "error":
             render_one(job, clip, words_now)
+
+    def prepare(clips):
+        """Get the same accurate clip words as before, then polish the clips in shared requests."""
+        heard = {}
+        def hear_clip(clip):
+            with work.task((job["id"], "captions-" + clip["id"]), timeout=CLIP_MINUTES * 60):
+                if pieces or not whole_video():
+                    timing.call(job, "video_download", _fetch_piece, job, clip, audio, audio_start=audio_start)
+                work.check()
+                if clip.get("status") == "error" or _has_caption_words(clip) or not (yt and yt[1].lower().startswith("en")):
+                    return None
+                a0 = max(lo, int((clip["start"] - audio_start - 1.5) * 16000))
+                b0 = min(hi, int((clip["end"] - audio_start + 1.5) * 16000))
+                try:
+                    tw = [dict(w, s=round(w["s"] + audio_start + a0 / 16000, 2), e=round(w["e"] + audio_start + a0 / 16000, 2))
+                          for w in timing.call(job, "transcription", transcribe.transcribe, audio[a0:b0])]
+                except Exception:
+                    work.check()
+                    return None  # the clip can still use YouTube's transcript
+                work.check()
+                return audio_start + a0 / 16000, audio_start + b0 / 16000, tw
+        if clips and src["type"] == "url":
+            _set(job, stage="Getting the video for the clips")
+            pool = ThreadPoolExecutor(2, thread_name_prefix="clip-source")
+            pending = {pool.submit(ctx.bind(hear_clip), clip): clip for clip in clips if clip.get("status") != "error"}
+            deadline = time.monotonic() + CLIP_MINUTES * 60
+            try:
+                while pending and time.monotonic() < deadline:
+                    work.check()
+                    done, _ = wait(pending, timeout=.1)
+                    for future in done:
+                        clip = pending.pop(future)
+                        try:
+                            span = future.result()
+                            if span and len(span[2]) >= 3:
+                                exact[clip["id"]] = span
+                                heard[clip["id"]] = span[2]
+                        except Exception as e:
+                            work.check()
+                            clip.update(status="error", error=safe.friendly(e, 400))
+                            joblog.write(f"{clip['id']}: {e}", "error", job=job)
+                    if done and pending:
+                        _set(job, stage=f"Preparing the clips · {len(clips) - len(pending)} of {len(clips)} ready to render")
+                for clip in pending.values():
+                    clip.update(status="error", error="Preparing this clip took too long. Save and re-make to try again.")
+                    joblog.write(f"{clip['id']}: {clip['error']}", "error", job=job)
+            finally:
+                for future, clip in pending.items():
+                    work.cancel((job["id"], "captions-" + clip["id"]))
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+        _prepare_captions(job, clips, [heard.get(clip["id"], words) for clip in clips])
 
     cpus = os.cpu_count() or 4
     renders = ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))  # more clips made at once on a bigger machine
@@ -775,10 +840,11 @@ def _run_pipeline(job):
         if done_blocks < len(blocks):     # words past the last finished part are transcribed again
             cut = audio_start + blocks[done_blocks][0] / 16000
             words = [w for w in words if w["s"] < cut]
-        for c in job["clips"]:            # clips found before the restart that were not finished yet
-            if c.get("status") not in ("done", "error"):
-                c["status"] = "queued"
-                futures.append((renders.submit(ctx.bind(make), c, list(words), time.monotonic()), c))
+        unfinished = [c for c in job["clips"] if c.get("status") not in ("done", "error")]
+        prepare(unfinished)
+        for c in unfinished:            # clips found before the restart that were not finished yet
+            c["status"] = "queued"
+            futures.append((renders.submit(ctx.bind(make), c, list(words), time.monotonic()), c))
         save(job)
     # The transcript of the next part is written while the AI is still reading this one (the AI is a wait on the
     # network, the transcript is work on this machine), so neither waits for the other.
@@ -833,6 +899,8 @@ def _run_pipeline(job):
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"], status="queued", version=0)
             job["clips"].append(c)
             joblog.write(f"{c['id']}: moment found at {c['start']:g}–{c['end']:g} seconds; queued for rendering", job=job)
+        prepare(found)
+        for c in found:
             futures.append((renders.submit(ctx.bind(make), c, list(words), time.monotonic()), c))
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
         job["done_blocks"] = bi + 1       # a restart from here on carries on with the next part

@@ -362,6 +362,7 @@ class SpeedTests(unittest.TestCase):
                 asr = mock(jobs.transcribe, "transcribe", return_value=words)
                 mock(media, "youtube_words", return_value=(
                     ([dict(w, s=w["s"] + 120, e=w["e"] + 120) for w in words], "es") if youtube else None))
+                mock(media, "youtube_english_words", return_value=None)
                 mock(jobs.brain, "find_clips", return_value=([{"start": 1, "end": 8, "score": 90}], {}))
                 piece = mock(jobs, "_fetch_piece")
                 rendered = mock(jobs, "render_one")

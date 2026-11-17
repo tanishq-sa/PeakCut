@@ -51,6 +51,7 @@ def main() -> int:
                 ("deleting and bulk actions", ["tests/test_delete.py"]),
                 ("big uploads in pieces", ["tests/test_upload_parts.py", BASE]),
                 ("AI services", ["tests/test_ai.py"]),
+                ("shared AI requests and caption polishing", ["tests/test_ai_savings.py"]),
                 ("YouTube live chat and reaction spikes", ["tests/test_youtube_chat.py"]),
                 ("speed, background work and transcript recovery", ["tests/test_speed.py"]),
                 ("cancellation, live history, AI deadlines, dashboard and editing", ["tests/test_next.py"]),
